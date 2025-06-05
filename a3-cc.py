@@ -81,6 +81,15 @@ class Sender:
         self.last_ack_id_seen = {}
         self.done = False
         self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
+        
+        self.cwnd = packet_size
+        self.send_time = {}
+        self.estimated_rtt = 1.0
+        self.dev_rtt = 0.0
+        self.alpha = 1 / 64
+        self.beta = 1 / 4
+        self.rto = 1.0
+
 
     def timeout(self):
         '''Called when the sender times out.'''
@@ -91,7 +100,14 @@ class Sender:
             return
 
         if self.unacknowledged:
+            # timeout 時選擇最早未被 ack 的封包重傳
             self.next_seq = min(self.unacknowledged)
+
+            # 觸發 AIMD 的 multiplicative decrease
+            self.cwnd = max(payload_size, self.cwnd / 2)
+
+            # 印 log 幫助 debug
+            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reduced to {self.cwnd:.2f}")
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -117,11 +133,23 @@ class Sender:
                     self.unacknowledged.remove(seq)
                     self.acknowledged.add(seq)
                     new_acknowledged += actual_size
+                    
+                    #  Additive Increase：每收到一個新 ack，增加 cwnd
+                    self.cwnd += (payload_size * payload_size) / self.cwnd
+
+                # 根據 packet_id 更新 RTT 與 RTO
+                if packet_id in self.send_time:
+                    sample_rtt = time.time() - self.send_time[packet_id]
+                    self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
+                    self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
+                    self.rto = self.estimated_rtt + 4 * self.dev_rtt
+                    del self.send_time[packet_id]
+
                 self.dup_ack_count.pop(seq, None)
                 self.last_ack_id_seen[seq] = packet_id
 
-        if not sacks:
-            return new_acknowledged
+            if not sacks:
+                return new_acknowledged
 
         base_seq = min(start for start, _ in sacks)
         retransmit_ranges = []
@@ -175,6 +203,9 @@ class Sender:
 
         if sacks:
             self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
+            
+        # ✅ 印出目前 cwnd 和 rto 狀態
+        print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
 
         return new_acknowledged
 
@@ -213,11 +244,13 @@ class Sender:
 
     def get_cwnd(self) -> int:
         # TODO
-        return packet_size
+        return max(packet_size, int(self.cwnd))
+
 
     def get_rto(self) -> float:
         # TODO
-        return 1.
+        return max(0.001, self.rto)
+
 
 def start_receiver(ip: str, port: int):
     '''Starts a receiver thread. For each source address, we start a new
@@ -377,6 +410,10 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 if random.random() < simloss:
                     print("Dropped!")
                 else:
+                    
+                    sender.send_time[packet_id] = time.time()
+
+                    
                     pkt_str = json.dumps(
                         {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
                     ).encode()
@@ -438,7 +475,7 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
-            start_sender(args.ip, args.port, data, args.recv_window, args.simloss)
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss,1)
 
 if __name__ == "__main__":
     main()
