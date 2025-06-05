@@ -1,0 +1,26 @@
+cd C:\NSYSU\大二下\電腦網路\a2\a2-starter-code
+
+python transport.py --ip 127.0.0.1 --port 7000 receiver
+
+
+1.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt sender
+
+
+2.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.1 sender
+
+3.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.3 sender
+
+4.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.5 sender
+
+5.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.9 sender
+
+6.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --pkts_to_reorder 3 sender
+
+7.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --pkts_to_reorder 5 sender
+
+8.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --pkts_to_reorder 7 sender
+
+9.python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.1 --pkts_to_reorder 7 sender
+
+
+python transport.py --ip 127.0.0.1 --port 7000 --sendfile test_file.txt --simloss 0.05 --pkts_to_reorder 1 sender

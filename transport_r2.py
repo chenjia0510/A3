@@ -1,12 +1,11 @@
-# Your Name: xxxx
-# Your ID: Bxxxxxx
+#B124020034 蔡承家
+
 
 import argparse
 import json
+from typing import Dict, List, Optional, Tuple
 import random
 import socket
-import time
-from typing import Any, Dict, List, Optional, Tuple
 
 # Note: In this starter code, we annotate types where
 # appropriate. While it is optional, both in python and for this
@@ -16,6 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 payload_size = 1200
 # The maximum size of a packet including all the JSON formatting
 packet_size = 1500
+
 
 class Receiver:
     def __init__(self):
@@ -34,10 +34,8 @@ class Receiver:
         # 回傳目前為止有哪些資料我「確認收到」（ack_ranges）
         
         #收過了，ACK回去，不交給L7
-        # 如果收到的封包有重疊（但不是完全落後），還是要存進 buffer
-        if seq_range[1] <= self.expected_seq:
-            return [(seq_range[0], seq_range[1])], ""  # 完全收到過的就不要再處理
-
+        if(seq_range[0] < self.expected_seq):
+            return [(seq_range[0], self.expected_seq)], ""
         
         #不管怎樣，都先存到buffer中
         self.buffer[seq_range[0]] = data
@@ -64,13 +62,9 @@ class Receiver:
         else:
             print("All data was successfully received and delivered.")
 
+
 class Sender:
     def __init__(self, data_len: int):
-        '''`data_len` is the length of the data we want to send. A real
-        transport will not force the application to pre-commit to the
-        length of data, but we are ok with it.
-
-        '''
         # TODO: Initialize any variables you want here, for instance a
         self.data_len = data_len # The total amount of data
         self.next_seq = 0  # The sequence number of the next byte to send
@@ -79,35 +73,17 @@ class Sender:
         self.dup_ack_count = {}
         self.cumulative_sacks = []
         self.last_ack_id_seen = {}
-        self.done = False
-        self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
-        
-        self.cwnd = packet_size
-        self.send_time = {}
-        self.estimated_rtt = 1.0
-        self.dev_rtt = 0.0
-        self.alpha = 1 / 64
-        self.beta = 1 / 4
-        self.rto = 1.0
 
 
     def timeout(self):
-        '''Called when the sender times out.'''
         # TODO: Initialize any variables you want here, for instance a
         ''' Called when the sender times out and needs to retransmit '''
-        if self.next_seq >= self.data_len and not self.unacknowledged:
-            self.done = True  #通知主程式傳送真的結束
-            return
-
-        if self.unacknowledged:
-            # timeout 時選擇最早未被 ack 的封包重傳
-            self.next_seq = min(self.unacknowledged)
-
-            # 觸發 AIMD 的 multiplicative decrease
-            self.cwnd = max(payload_size, self.cwnd / 2)
-
-            # 印 log 幫助 debug
-            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reduced to {self.cwnd:.2f}")
+        # Find the smallest unacked seq
+        for seq in self.unacknowledged:
+            self.next_seq = min(seq, self.next_seq)
+        self.unacknowledged = set()
+        
+        #把unack清空 交給timer處理
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -120,7 +96,6 @@ class Sender:
         600, even if 1000s of bytes have been ACKed before this.
 
         '''
-
         # TODO
         '''Called every time we get an acknowledgment.'''
         new_acknowledged = 0
@@ -128,34 +103,21 @@ class Sender:
         # 紀錄已被 ack 的封包，並清除其 dup 記錄
         for start, end in sacks:
             for seq in range(start, end, payload_size):
-                actual_size = min(payload_size, end - seq)
                 if seq in self.unacknowledged:
                     self.unacknowledged.remove(seq)
                     self.acknowledged.add(seq)
-                    new_acknowledged += actual_size
-                    
-                    #  Additive Increase：每收到一個新 ack，增加 cwnd
-                    self.cwnd += (payload_size * payload_size) / self.cwnd
-
-                # 根據 packet_id 更新 RTT 與 RTO
-                if packet_id in self.send_time:
-                    sample_rtt = time.time() - self.send_time[packet_id]
-                    self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                    self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-                    self.rto = self.estimated_rtt + 4 * self.dev_rtt
-                    del self.send_time[packet_id]
-
+                    new_acknowledged += 1
                 self.dup_ack_count.pop(seq, None)
                 self.last_ack_id_seen[seq] = packet_id
 
-            if not sacks:
-                return new_acknowledged
+        if not sacks:
+            return new_acknowledged
 
         base_seq = min(start for start, _ in sacks)
         retransmit_ranges = []
 
         for seq in list(self.unacknowledged):
-            # 只處理 base_seq 前的封包
+            # ✅ 只處理 base_seq 前的封包
             if seq >= base_seq:
                 continue
 
@@ -200,38 +162,27 @@ class Sender:
         for start, end in merged:
             print(f"DUP retransmit Sending seq: ({start}, {end})")
 
-
-        if sacks:
-            self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
-            
-        # ✅ 印出目前 cwnd 和 rto 狀態
-        print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
-
         return new_acknowledged
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         '''Called just before we are going to send a data packet. Should
         return the range of sequence numbers we should send. If there
         are no more bytes to send, returns a zero range (i.e. the two
-        elements of the tuple are equal). Return None if there are no
+        elements of the tuple are equal). Returns None if there are no
         more bytes to send, and _all_ bytes have been
         acknowledged. Note: The range should not be larger than
         `payload_size` or contain any bytes that have already been
         acknowledged
 
         '''
-
         # TODO
         # Check if we've reached the end and have no more data to send
-        if self.done:
-            return None 
-        
         if self.next_seq >= self.data_len:
-            if self.highest_sack >= self.data_len:
-                self.done = True
-                return None
+            # 如果還有東西沒被 ACK，就等 ACK，不要結束
+            if len(self.unacknowledged) > 0:
+                return (self.data_len, self.data_len)  # 這樣會讓主程式 wait
             else:
-                return (self.data_len, self.data_len)
+                return None
 
         # Find the next Unacked seq and send it
         while self.next_seq in self.acknowledged:
@@ -242,23 +193,14 @@ class Sender:
         self.next_seq = end_seq
         return seq_range
 
-    def get_cwnd(self) -> int:
-        # TODO
-        return max(packet_size, int(self.cwnd))
-
-
-    def get_rto(self) -> float:
-        # TODO
-        return max(0.001, self.rto)
-
 
 def start_receiver(ip: str, port: int):
     '''Starts a receiver thread. For each source address, we start a new
-    Receiver class. When a fin packet is received, we call the
-    finish function of that class.
+    `Receiver` class. When a `fin` packet is received, we call the
+    `finish` function of that class.
 
     We start listening on the given IP address and port. By setting
-    the IP address to be 0.0.0.0, you can make it listen on all
+    the IP address to be `0.0.0.0`, you can make it listen on all
     available interfaces. A network interface is typically a device
     connected to a computer that interfaces with the physical world to
     send/receive packets. The WiFi and ethernet cards on personal
@@ -274,12 +216,12 @@ def start_receiver(ip: str, port: int):
     permission from the OS. Pick a larger number. Numbers in the
     8000-9000 range are conventional.
 
-    Virtual interfaces also exist. The most common one is localhost',
-    which has the default IP address of 127.0.0.1 (a universal
+    Virtual interfaces also exist. The most common one is `localhost',
+    which has the default IP address of `127.0.0.1` (a universal
     constant across most machines). The Mahimahi network emulator also
     creates virtual interfaces that behave like real interfaces, but
     really only emulate a network link in software that shuttles
-    packets between different virtual interfaces. Use ifconfig in a
+    packets between different virtual interfaces. Use `ifconfig` in a
     terminal to find out what interfaces exist in your machine or
     inside a Mahimahi shell
 
@@ -325,7 +267,7 @@ def start_receiver(ip: str, port: int):
                 # Send the ACK
                 server_socket.sendto(json.dumps({"type": "ack", "sacks": sacks, "id": received["id"]}).encode(), addr)
             elif received["type"] == "fin":
-                if addr in receivers:  # 加這行避免 KeyError
+                if addr in receivers:  # ✅ ← 加這行避免 KeyError
                     receivers[addr][0].finish()
                     # Check if the file is received and send fin-ack
                     if received_data:
@@ -334,8 +276,6 @@ def start_receiver(ip: str, port: int):
                         server_socket.sendto(json.dumps({"type": "fin"}).encode(), addr)
                         received_data = ''
 
-                    
-                    receivers[addr][1].close() #你加這句看看
                     del receivers[addr]
 
             else:
@@ -359,7 +299,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         packet_id = 0
         wait = False
         send_buf = []
-        
 
         while True:
             # Do we have enough room in recv_window to send an entire
@@ -410,10 +349,6 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 if random.random() < simloss:
                     print("Dropped!")
                 else:
-                    
-                    sender.send_time[packet_id] = time.time()
-
-                    
                     pkt_str = json.dumps(
                         {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
                     ).encode()
@@ -454,17 +389,17 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     sender.timeout()
 
 
-
 def main():
     parser = argparse.ArgumentParser(description="Transport assignment")
     parser.add_argument("role", choices=["sender", "receiver"], help="Role to play: 'sender' or 'receiver'")
     parser.add_argument("--ip", type=str, required=True, help="IP address to bind/connect to")
     parser.add_argument("--port", type=int, required=True, help="Port number to bind/connect to")
-    parser.add_argument("--sendfile", type=str, required=False, help="If role=sender, the file that contains data to send")
-    parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
-    parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
-
-
+    parser.add_argument("--sendfile", type=str, required=False,
+                        help="If role=sender, the file that contains data to send")
+    parser.add_argument("--recv_window", type=int, default=15000, help="Receive window size in bytes")
+    parser.add_argument("--simloss", type=float, default=0.0,
+                        help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
+    parser.add_argument("--pkts_to_reorder", type=int, default=1, help="Number of packets to shuffle randomly")
 
     args = parser.parse_args()
 
@@ -477,7 +412,8 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
-            start_sender(args.ip, args.port, data, args.recv_window, args.simloss,1)
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss, args.pkts_to_reorder)
+
 
 if __name__ == "__main__":
     main()
