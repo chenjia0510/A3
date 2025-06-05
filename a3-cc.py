@@ -463,6 +463,9 @@ def main():
     parser.add_argument("--sendfile", type=str, required=False, help="If role=sender, the file that contains data to send")
     parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
     parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
+    parser.add_argument("--pkts_to_reorder", type=int, default=1, help="Number of packets to buffer before reordering")
+
+
 
     args = parser.parse_args()
 
