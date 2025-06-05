@@ -129,7 +129,7 @@ class Sender:
         for start, end in sacks:
             for seq in range(start, end, payload_size):
                 actual_size = min(payload_size, end - seq)
-                if seq in self.unacknowledged:
+                if seq not in self.acknowledged and seq in self.unacknowledged:
                     self.unacknowledged.remove(seq)
                     self.acknowledged.add(seq)
                     new_acknowledged += actual_size
@@ -364,7 +364,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         while True:
             # Do we have enough room in recv_window to send an entire
             # packet?
-            if inflight + packet_size < recv_window and not wait:
+            if inflight + payload_size <= sender.get_cwnd() and not wait:
                 seq = sender.send(packet_id)
                 got_fin_ack = False
                 if seq is None:
@@ -429,7 +429,12 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                             client_socket.send(p)
                         send_buf = []
 
-                inflight += seq[1] - seq[0]
+                packet_len = seq[1] - seq[0]
+                if inflight + packet_len > sender.get_cwnd():
+                    wait = True
+                    continue
+                inflight += packet_len
+                
                 packet_id += 1
 
             else:
@@ -447,7 +452,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         continue
 
                     inflight -= sender.ack_packet(received["sacks"], received["id"])
-                    assert inflight >= 0
+                    inflight = max(0, inflight)
                 except socket.timeout:
                     inflight = 0
                     print("Timeout")
