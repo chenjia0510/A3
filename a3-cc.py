@@ -19,55 +19,50 @@ packet_size = 1500
 
 class Receiver:
     def __init__(self):
-        # TODO: Initialize any variables you want here, like the receive
-        # buffer, initial congestion window and initial values for the timeout
-        # values
+        # TODO: Initialize any variables you want here, like the receive buffer
+        # Initialize a buffer to store received data until it's ready for delivery
+        self.buffer = {}
+        self.expected_seq = 0
 
     def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[List[Tuple[int, int]], str]:
-        '''This function is called whenever a data packet is
-        received. `seq_range` is the range of sequence numbers
-        received: It contains two numbers: the starting sequence
-        number (inclusive) and ending sequence number (exclusive) of
-        the data received. `data` is a binary string of length
-        `seq_range[1] - seq_range[0]` representing the data.
-
-        It should output the list of sequence number ranges to
-        acknowledge and any data that is ready to be sent to the
-        application. Note, data must be sent to the application
-        _reliably_ and _in order_ of the sequence numbers. This means
-        that if bytes in sequence numbers 0-10000 and 11000-15000 have
-        been received, only 0-10000 must be sent to the application,
-        since if we send the latter bytes, we will not be able to send
-        bytes 10000-11000 in order when they arrive. The transport
-        layer must hide hide all packet reordering and loss.
-
-        The ultimate behavior of the program should be that the data
-        sent by the sender should be stored exactly in the same order
-        at the receiver in a file in the same directory. No gaps, no
-        reordering. You may assume that our test cases only ever send
-        printable ASCII characters (letters, numbers, punctuation,
-        newline etc), so that terminal output can be used to debug the
-        program.
-
-        '''
-
         # TODO
-        return ([], "")
+
+        # 把這個封包存進 buffer
+
+        # 試著把可以交付的資料送給應用層
+
+        # 回傳目前為止有哪些資料我「確認收到」（ack_ranges）
+        
+        #收過了，ACK回去，不交給L7
+        # 如果收到的封包有重疊（但不是完全落後），還是要存進 buffer
+        if seq_range[1] <= self.expected_seq:
+            return [(seq_range[0], seq_range[1])], ""  # 完全收到過的就不要再處理
+
+        
+        #不管怎樣，都先存到buffer中
+        self.buffer[seq_range[0]] = data
+        ack_ranges = [(seq_range[0], seq_range[1])]
+
+        #從buffer裡面拿資料
+        ready_data = ""
+        while self.expected_seq in self.buffer:
+            packet = self.buffer[self.expected_seq]
+            ready_data += packet
+            del self.buffer[self.expected_seq]
+            newExpected = self.expected_seq + len(packet)
+            ack_ranges.append((self.expected_seq, newExpected))
+            self.expected_seq = newExpected  # Increment by the length of the current packet
+        
+        # Acknowledge the range of sequence numbers received
+        return ack_ranges, ready_data
 
     def finish(self):
-        '''Called when the sender sends the `fin` packet. You don't need to do
-        anything in particular here. You can use it to check that all
-        data has already been sent to the application at this
-        point. If not, there is a bug in the code. A real transport
-        stack will deallocate the receive buffer. Note, this may not
-        be called if the fin packet from the sender is locked. You can
-        read up on "TCP connection termination" to know more about how
-        TCP handles this.
-
-        '''
-
         # TODO
-        pass
+        ''' Check if all data has been sent to the application'''
+        if self.buffer:
+            print("Not all data was sent to the application. There might be an issue.")
+        else:
+            print("All data was successfully received and delivered.")
 
 class Sender:
     def __init__(self, data_len: int):
@@ -77,13 +72,26 @@ class Sender:
 
         '''
         # TODO: Initialize any variables you want here, for instance a
-        # data structure to keep track of which packets have been
-        # sent, acknowledged, detected to be lost or retransmitted
+        self.data_len = data_len # The total amount of data
+        self.next_seq = 0  # The sequence number of the next byte to send
+        self.acknowledged = set()  # Set of acknowledged sequence numbers
+        self.unacknowledged = set()  # Set of unacknowledged sequence numbers
+        self.dup_ack_count = {}
+        self.cumulative_sacks = []
+        self.last_ack_id_seen = {}
+        self.done = False
+        self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
 
     def timeout(self):
         '''Called when the sender times out.'''
-        # TODO: In addition to what you did in assignment 1, set cwnd to 1
-        # packet
+        # TODO: Initialize any variables you want here, for instance a
+        ''' Called when the sender times out and needs to retransmit '''
+        if self.next_seq >= self.data_len and not self.unacknowledged:
+            self.done = True  #通知主程式傳送真的結束
+            return
+
+        if self.unacknowledged:
+            self.next_seq = min(self.unacknowledged)
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -98,7 +106,77 @@ class Sender:
         '''
 
         # TODO
-        return 0
+        '''Called every time we get an acknowledgment.'''
+        new_acknowledged = 0
+
+        # 紀錄已被 ack 的封包，並清除其 dup 記錄
+        for start, end in sacks:
+            for seq in range(start, end, payload_size):
+                actual_size = min(payload_size, end - seq)
+                if seq in self.unacknowledged:
+                    self.unacknowledged.remove(seq)
+                    self.acknowledged.add(seq)
+                    new_acknowledged += actual_size
+                self.dup_ack_count.pop(seq, None)
+                self.last_ack_id_seen[seq] = packet_id
+
+        if not sacks:
+            return new_acknowledged
+
+        base_seq = min(start for start, _ in sacks)
+        retransmit_ranges = []
+
+        for seq in list(self.unacknowledged):
+            # 只處理 base_seq 前的封包
+            if seq >= base_seq:
+                continue
+
+            in_sack = any(start <= seq < end for start, end in sacks)
+            if not in_sack:
+                if self.last_ack_id_seen.get(seq) != packet_id:
+                    self.dup_ack_count[seq] = self.dup_ack_count.get(seq, 0) + 1
+                    self.last_ack_id_seen[seq] = packet_id
+
+                    if self.dup_ack_count[seq] % 3 == 0:
+                        retransmit_ranges.append((seq, seq + payload_size))
+                        self.next_seq = min(self.next_seq, seq)
+            else:
+                self.dup_ack_count.pop(seq, None)
+                self.last_ack_id_seen[seq] = packet_id
+
+        # 印 cumulative SACK 狀態
+        ack_list = sorted(self.acknowledged)
+        merged_sacks = []
+        if ack_list:
+            start = ack_list[0]
+            end = start + payload_size
+            for seq in ack_list[1:]:
+                if seq == end:
+                    end += payload_size
+                else:
+                    merged_sacks.append([start, end])
+                    start = seq
+                    end = start + payload_size
+            merged_sacks.append([start, end])
+        print(f"Got ACK sacks: {merged_sacks}, id: {packet_id}")
+
+        # 合併 retransmit 區段
+        retransmit_ranges.sort()
+        merged = []
+        for start, end in retransmit_ranges:
+            if not merged or merged[-1][1] < start:
+                merged.append((start, end))
+            else:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+        for start, end in merged:
+            print(f"DUP retransmit Sending seq: ({start}, {end})")
+
+
+        if sacks:
+            self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
+
+        return new_acknowledged
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         '''Called just before we are going to send a data packet. Should
@@ -113,7 +191,25 @@ class Sender:
         '''
 
         # TODO
-        pass
+        # Check if we've reached the end and have no more data to send
+        if self.done:
+            return None 
+        
+        if self.next_seq >= self.data_len:
+            if self.highest_sack >= self.data_len:
+                self.done = True
+                return None
+            else:
+                return (self.data_len, self.data_len)
+
+        # Find the next Unacked seq and send it
+        while self.next_seq in self.acknowledged:
+            self.next_seq = min(self.next_seq + payload_size, self.data_len)
+        end_seq = min(self.next_seq + payload_size, self.data_len)
+        self.unacknowledged.add(self.next_seq)
+        seq_range = (self.next_seq, end_seq)
+        self.next_seq = end_seq
+        return seq_range
 
     def get_cwnd(self) -> int:
         # TODO
@@ -125,11 +221,11 @@ class Sender:
 
 def start_receiver(ip: str, port: int):
     '''Starts a receiver thread. For each source address, we start a new
-    `Receiver` class. When a `fin` packet is received, we call the
-    `finish` function of that class.
+    Receiver class. When a fin packet is received, we call the
+    finish function of that class.
 
     We start listening on the given IP address and port. By setting
-    the IP address to be `0.0.0.0`, you can make it listen on all
+    the IP address to be 0.0.0.0, you can make it listen on all
     available interfaces. A network interface is typically a device
     connected to a computer that interfaces with the physical world to
     send/receive packets. The WiFi and ethernet cards on personal
@@ -145,61 +241,75 @@ def start_receiver(ip: str, port: int):
     permission from the OS. Pick a larger number. Numbers in the
     8000-9000 range are conventional.
 
-    Virtual interfaces also exist. The most common one is `localhost',
-    which has the default IP address of `127.0.0.1` (a universal
+    Virtual interfaces also exist. The most common one is localhost',
+    which has the default IP address of 127.0.0.1 (a universal
     constant across most machines). The Mahimahi network emulator also
     creates virtual interfaces that behave like real interfaces, but
     really only emulate a network link in software that shuttles
-    packets between different virtual interfaces.
+    packets between different virtual interfaces. Use ifconfig in a
+    terminal to find out what interfaces exist in your machine or
+    inside a Mahimahi shell
 
     '''
 
-    receivers: Dict[str, Receiver] = {}
-
+    receivers: Dict[str, Tuple[Receiver, Any]] = {}
+    received_data = ''
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
         server_socket.bind((ip, port))
 
         while True:
+            print("======= Waiting =======")
             data, addr = server_socket.recvfrom(packet_size)
-            if addr not in receivers:
-                receivers[addr] = Receiver()
+            #檢查一下，是不是第一次遇到這個sender
+            if addr not in receivers and json.loads(data.decode())["type"] == "data":
+                #是的話，寫新的檔案，然候放進receivers的dicts裡面
+                outfile = open(f'rcvd-{addr[0]}-{addr[1]}.txt', 'w')
+                receivers[addr] = (Receiver(), outfile)
+
 
             received = json.loads(data.decode())
             if received["type"] == "data":
-                # Format check. Real code will have much more
-                # carefully designed checks to defend against
-                # attacks. Can you think of ways to exploit this
-                # transport layer and cause problems at the receiver?
-                # This is just for fun. It is not required as part of
-                # the assignment.
+
+                
+                #因為UDP不保證完整信，因此手動檢查
+                
+                #檢查是否為list
                 assert type(received["seq"]) is list
+                #檢查seq標示的位置是否有錯
                 assert type(received["seq"][0]) is int and type(received["seq"][1]) is int
+                #確定payload包字串
                 assert type(received["payload"]) is str
+                #檢查有沒有超過限制
                 assert len(received["payload"]) <= payload_size
 
-                # Deserialize the packet. Real transport layers use
-                # more efficient and standardized ways of packing the
-                # data. One option is to use protobufs (look it up)
-                # instead of json. Protobufs can automatically design
-                # a byte structure given the data structure. However,
-                # for an internet standard, we usually want something
-                # more custom and hand-designed.
-                sacks, app_data = receivers[addr].data_packet(tuple(received["seq"]), received["payload"])
+                sacks, app_data = receivers[addr][0].data_packet(tuple(received["seq"]), received["payload"])
                 # Note: we immediately write the data to file
-                #receivers[addr][1].write(app_data)
+                receivers[addr][1].write(app_data)
+                receivers[addr][1].flush() 
+                print(f"Received seq: {received['seq']}, id: {received['id']}, sending sacks: {sacks}")
+                received_data += app_data
 
                 # Send the ACK
                 server_socket.sendto(json.dumps({"type": "ack", "sacks": sacks, "id": received["id"]}).encode(), addr)
-
-
             elif received["type"] == "fin":
-                receivers[addr].finish()
-                del receivers[addr]
+                if addr in receivers:  # 加這行避免 KeyError
+                    receivers[addr][0].finish()
+                    # Check if the file is received and send fin-ack
+                    if received_data:
+                        print("received data (summary): ", received_data[:100], "...", len(received_data))
+                        print("received file is saved into: ", receivers[addr][1].name)
+                        server_socket.sendto(json.dumps({"type": "fin"}).encode(), addr)
+                        received_data = ''
+
+                    
+                    receivers[addr][1].close() #你加這句看看
+                    del receivers[addr]
 
             else:
                 assert False
 
-def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float):
+
+def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float, pkts_to_reorder: int):
     sender = Sender(len(data))
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
@@ -207,26 +317,53 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         client_socket.connect((ip, port))
         # When waiting for packets when we call receivefrom, we
         # shouldn't wait more than 500ms
+        client_socket.settimeout(0.5)
 
         # Number of bytes that we think are inflight. We are only
         # including payload bytes here, which is different from how
         # TCP does things
         inflight = 0
-        packet_id  = 0
+        packet_id = 0
         wait = False
+        send_buf = []
+        
 
         while True:
-            # Get the congestion condow
-            cwnd = sender.get_cwnd()
-
             # Do we have enough room in recv_window to send an entire
             # packet?
-            if inflight + packet_size <= min(recv_window, cwnd) and not wait:
+            if inflight + packet_size < recv_window and not wait:
                 seq = sender.send(packet_id)
+                got_fin_ack = False
                 if seq is None:
                     # We are done sending
+                    # print("#######send_buf#########: ", len(send_buf))
+                    if send_buf:
+                        random.shuffle(send_buf)
+                        for p in send_buf:
+                            client_socket.send(p)
+                        send_buf = []
                     client_socket.send('{"type": "fin"}'.encode())
-                    break
+                    try:
+                        print("======= Final Waiting =======")
+                        received = client_socket.recv(packet_size)
+                        received = json.loads(received.decode())
+                        if received["type"] == "ack":
+                            client_socket.send('{"type": "fin"}'.encode())
+                            continue
+                        elif received["type"] == "fin":
+                            print(f"Got FIN-ACK")
+                            got_fin_ack = True
+                            break
+                    except socket.timeout:
+                        inflight = 0
+                        print("Timeout")
+                        sender.timeout()
+                        exit(1)
+                    if got_fin_ack:
+                        break
+                    else:
+                        continue
+
                 elif seq[1] == seq[0]:
                     # No more packets to send until loss happens. Wait
                     wait = True
@@ -234,16 +371,26 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
 
                 assert seq[1] - seq[0] <= payload_size
                 assert seq[1] <= len(data)
+                print(f"Sending seq: {seq}, id: {packet_id}")
 
                 # Simulate random loss before sending packets
                 if random.random() < simloss:
-                    pass
+                    print("Dropped!")
                 else:
-                    # Send the packet
-                    client_socket.send(
-                        json.dumps(
-                            {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
-                        ).encode())
+                    pkt_str = json.dumps(
+                        {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
+                    ).encode()
+                    # pkts_to_reorder is a variable that bounds the maximum amount of reordering. To disable reordering, set to 1
+                    if len(send_buf) < pkts_to_reorder:
+                        send_buf += [pkt_str]
+
+                    if len(send_buf) == pkts_to_reorder:
+                        # Randomly shuffle send_buf
+                        random.shuffle(send_buf)
+
+                        for p in send_buf:
+                            client_socket.send(p)
+                        send_buf = []
 
                 inflight += seq[1] - seq[0]
                 packet_id += 1
@@ -252,13 +399,14 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 wait = False
                 # Wait for ACKs
                 try:
-                    rto = sender.get_rto()
-                    client_socket.settimeout(rto)
-                    received_bytes = client_socket.recv(packet_size)
-                    received = json.loads(received_bytes.decode())
+                    print("======= Waiting =======")
+                    received = client_socket.recv(packet_size)
+                    received = json.loads(received.decode())
                     assert received["type"] == "ack"
 
+                    # print(f"Got ACK sacks: {received['sacks']}, id: {received['id']}")
                     if random.random() < simloss:
+                        print("Dropped ack!")
                         continue
 
                     inflight -= sender.ack_packet(received["sacks"], received["id"])
@@ -267,6 +415,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     inflight = 0
                     print("Timeout")
                     sender.timeout()
+
 
 
 def main():
