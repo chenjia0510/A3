@@ -104,24 +104,18 @@ class Sender:
             return
 
         if self.unacknowledged:
-            # ✅ 找到最早未 ACK 的封包
-            oldest = min(self.unacknowledged)
+            # timeout 時選擇最早未被 ack 的封包重傳
+            self.next_seq = min(self.unacknowledged)
 
-            # ✅ 如果這包其實已經被 ACK，不做 timeout 動作
-            if oldest in self.acknowledged:
-                print(f"[TIMEOUT] Ignored for already ACKed seq {oldest}")
-                return
+            # 觸發 AIMD 的 multiplicative decrease
+            self.cwnd = max(payload_size, self.cwnd / 2)
 
-            # ✅ 執行 timeout：重傳這包，調整 cwnd & 狀態
-            self.next_seq = oldest
+           
             self.ssthresh = max(self.cwnd / 2, payload_size)
-            self.cwnd = payload_size
-            self.state = "slow_start"
-            self.dup_ack_count.clear()
+            self.cwnd = payload_size  # = 1 MSS
+            self.state = "slow_start"  
+            self.dup_ack_count.clear()  
             print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reset to {self.cwnd}, ssthresh = {self.ssthresh}")
-
-            # ✅ 加入重傳 queue
-            self.retransmit_queue.append((self.next_seq, self.next_seq + payload_size))
 
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
@@ -149,7 +143,6 @@ class Sender:
                     self.acknowledged.add(seq)
                     new_acknowledged += actual_size
                     
-                        # ✅ 根據不同階段更新 cwnd
                     if self.state == "slow_start":
                         self.cwnd += payload_size
                         self.dup_ack_count.clear()
@@ -233,7 +226,7 @@ class Sender:
         if sacks:
             self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
             
-        # ✅ 印出目前 cwnd 和 rto 狀態
+        
         print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
         
         # 判斷是否收到 new ACK 結束 fast recovery
