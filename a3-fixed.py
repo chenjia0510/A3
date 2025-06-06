@@ -90,6 +90,7 @@ class Sender:
         self.rto = 1.0
         self.retransmit_queue = []
         self.fixed_cwnd = fixed_cwnd if fixed_cwnd is not None else 1200  # default 1 MSS
+        self.send_queue = []
 
 
 
@@ -99,14 +100,17 @@ class Sender:
         # TODO: Initialize any variables you want here, for instance a
         ''' Called when the sender times out and needs to retransmit '''
         if self.next_seq >= self.data_len and not self.unacknowledged:
-            self.done = True  #通知主程式傳送真的結束
+            self.done = True
             return
 
         if self.unacknowledged:
-            # timeout 時選擇最早未被 ack 的封包重傳
-            self.next_seq = min(self.unacknowledged)
-
-            # 觸發 AIMD 的 multiplicative decrease
+            # timeout 時重傳最早還沒 ack 的封包
+            seq = min(self.unacknowledged)
+            end_seq = min(seq + payload_size, self.data_len)
+            print(f"[TIMEOUT] Retransmitting seq: ({seq}, {end_seq})")
+            self.retransmit_queue.append((seq, end_seq))
+            self.next_seq = seq  # 指針回到這邊保證下一輪會送出
+                # 觸發 AIMD 的 multiplicative decrease
 
            
 
@@ -230,37 +234,42 @@ class Sender:
         # Check if we've reached the end and have no more data to send
         
         # 如果有重傳封包要送，優先送這個
-        if self.retransmit_queue:
-            start, end = self.retransmit_queue.pop(0)
-            if start not in self.acknowledged:
-                self.unacknowledged.add(start)
-                return (start, end)
-        
         if self.done:
-            return None 
-        
-        if self.next_seq >= self.data_len:
-            if self.highest_sack >= self.data_len:
-                self.done = True
-                return None
-            else:
-                return (self.data_len, self.data_len)
+            return None
 
-        # Find the next Unacked seq and send it
-        while self.next_seq in self.acknowledged:
-            self.next_seq = min(self.next_seq + payload_size, self.data_len)
-            
-            
-        # 防止送出已經被 ack 的區段
-        if self.next_seq in self.acknowledged:
-            return None    
-        
-        end_seq = min(self.next_seq + payload_size, self.data_len)
-        self.unacknowledged.add(self.next_seq)
-        seq_range = (self.next_seq, end_seq)
-        self.next_seq = end_seq
-        return seq_range
+        # 1. 若有排好的 queue，直接吐出（pipeline 中的一包）
+        if hasattr(self, "send_queue") and self.send_queue:
+            return self.send_queue.pop(0)
 
+        # 2. 建立 send_queue（pipeline），把 cwnd 容許範圍內的包先放進來
+        inflight_bytes = sum([
+            min(self.data_len - seq, payload_size)
+            for seq in self.unacknowledged
+            if seq not in self.acknowledged
+        ])
+
+        budget = self.get_cwnd() - inflight_bytes
+        self.send_queue = []
+
+        while budget > 0 and self.next_seq < self.data_len:
+            if self.next_seq in self.acknowledged:
+                self.next_seq += payload_size
+                continue
+
+            end_seq = min(self.next_seq + payload_size, self.data_len)
+            self.unacknowledged.add(self.next_seq)
+            self.send_queue.append((self.next_seq, end_seq))
+            budget -= (end_seq - self.next_seq)
+            self.next_seq = end_seq
+
+        if self.send_queue:
+            return self.send_queue.pop(0)
+
+        if self.highest_sack >= self.data_len:
+            self.done = True
+            return None
+
+        return (self.data_len, self.data_len)
     def get_cwnd(self) -> int:
         # TODO
         return max(packet_size, int(self.cwnd))
