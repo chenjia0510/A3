@@ -91,6 +91,7 @@ class Sender:
         self.rto = 1.0
         self.state = "slow_start"
         self.ssthresh = 64000
+        self.retransmit_queue = []
 
 
 
@@ -103,17 +104,24 @@ class Sender:
             return
 
         if self.unacknowledged:
-            # timeout 時選擇最早未被 ack 的封包重傳
-            self.next_seq = min(self.unacknowledged)
+            # ✅ 找到最早未 ACK 的封包
+            oldest = min(self.unacknowledged)
 
-            # 觸發 AIMD 的 multiplicative decrease
-            self.cwnd = max(payload_size, self.cwnd / 2)
+            # ✅ 如果這包其實已經被 ACK，不做 timeout 動作
+            if oldest in self.acknowledged:
+                print(f"[TIMEOUT] Ignored for already ACKed seq {oldest}")
+                return
 
-            # ✅ 對應 FSM 圖片 (18)(20)(21)
+            # ✅ 執行 timeout：重傳這包，調整 cwnd & 狀態
+            self.next_seq = oldest
             self.ssthresh = max(self.cwnd / 2, payload_size)
-            self.cwnd = payload_size  # = 1 MSS
-            self.state = "slow_start"  # ✅ 必加！否則會卡住
+            self.cwnd = payload_size
+            self.state = "slow_start"
+            self.dup_ack_count.clear()
             print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reset to {self.cwnd}, ssthresh = {self.ssthresh}")
+
+            # ✅ 加入重傳 queue
+            self.retransmit_queue.append((self.next_seq, self.next_seq + payload_size))
 
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
@@ -144,6 +152,7 @@ class Sender:
                         # ✅ 根據不同階段更新 cwnd
                     if self.state == "slow_start":
                         self.cwnd += payload_size
+                        self.dup_ack_count.clear()
                         # 若超過 ssthresh，就轉換到 congestion_avoidance
                         if self.cwnd >= self.ssthresh:
                             self.state = "congestion_avoidance"
@@ -181,8 +190,9 @@ class Sender:
 
                     if self.dup_ack_count[seq] == 3 and self.state != "fast_recovery":
                         self.ssthresh = self.cwnd / 2
-                        self.cwnd = min(self.ssthresh + 3 * payload_size, 60000)
+                        self.cwnd = self.ssthresh + 3 * payload_size
                         self.state = "fast_recovery"
+                        self.recovery_seq = max(end for _, end in sacks)
                         print("[Fast Recovery] Entered, cwnd =", self.cwnd)
                         retransmit_ranges.append((seq, seq + payload_size))
 
@@ -217,6 +227,7 @@ class Sender:
 
         for start, end in merged:
             print(f"DUP retransmit Sending seq: ({start}, {end})")
+        self.retransmit_queue.extend(merged)
 
 
         if sacks:
@@ -227,12 +238,14 @@ class Sender:
         
         # 判斷是否收到 new ACK 結束 fast recovery
         if self.state == "fast_recovery":
-                # Fast recovery exit 判斷新 ACK 的方式是：這個 ACK 把 highest_sack 往前推了
-                if self.highest_sack < max(end for _, end in sacks):
-                    self.cwnd = self.ssthresh
-                    self.state = "congestion_avoidance"
-                    print(f"[Fast Recovery Exit] cwnd reset to ssthresh = {self.cwnd}")
-            
+            new_highest = max(end for _, end in sacks)
+            if new_highest >= self.recovery_seq:
+                self.dup_ack_count.clear()
+                self.highest_sack = new_highest
+                self.cwnd = self.ssthresh
+                self.state = "congestion_avoidance"
+                print(f"[Fast Recovery Exit] cwnd reset to ssthresh = {self.cwnd}")
+
 
 
 
@@ -252,6 +265,14 @@ class Sender:
 
         # TODO
         # Check if we've reached the end and have no more data to send
+        
+        # 如果有重傳封包要送，優先送這個
+        if self.retransmit_queue:
+            start, end = self.retransmit_queue.pop(0)
+            if start not in self.acknowledged:
+                self.unacknowledged.add(start)
+                return (start, end)
+        
         if self.done:
             return None 
         
@@ -265,6 +286,12 @@ class Sender:
         # Find the next Unacked seq and send it
         while self.next_seq in self.acknowledged:
             self.next_seq = min(self.next_seq + payload_size, self.data_len)
+            
+            
+        # 防止送出已經被 ack 的區段
+        if self.next_seq in self.acknowledged:
+            return None    
+        
         end_seq = min(self.next_seq + payload_size, self.data_len)
         self.unacknowledged.add(self.next_seq)
         seq_range = (self.next_seq, end_seq)
@@ -395,7 +422,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         while True:
             # Do we have enough room in recv_window to send an entire
             # packet?
-            if inflight + payload_size <= sender.get_cwnd() and not wait:
+            while inflight + payload_size <= sender.get_cwnd() and not wait:
                 seq = sender.send(packet_id)
                 got_fin_ack = False
                 if seq is None:
