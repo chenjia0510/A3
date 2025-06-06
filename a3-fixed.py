@@ -16,264 +16,111 @@ from typing import Any, Dict, List, Optional, Tuple
 payload_size = 1200
 # The maximum size of a packet including all the JSON formatting
 packet_size = 1500
-
 class Receiver:
     def __init__(self):
-        # TODO: Initialize any variables you want here, like the receive buffer
-        # Initialize a buffer to store received data until it's ready for delivery
-        self.buffer = {}
-        self.expected_seq = 0
+        # ---------------  唯一改動：初始化收包狀態 ----------------
+        self.buf: Dict[int, str] = {}   # key = seq_start
+        self.expected = 0               # 下一個應收 seq
+    # ----------------------------------------------------------------
 
-    def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[List[Tuple[int, int]], str]:
-        # TODO
+    def data_packet(self, seq_range: Tuple[int, int], data: str)\
+            -> Tuple[List[Tuple[int, int]], str]:
+        # -----------------  最簡累積 ACK + 順序交付  -----------------
+        start, end = seq_range
 
-        # 把這個封包存進 buffer
+        # 已收過就直接回 ACK；不重複入 buffer
+        if end <= self.expected or start in self.buf:
+            return ([(0, self.expected)], "")
 
-        # 試著把可以交付的資料送給應用層
+        self.buf[start] = data
 
-        # 回傳目前為止有哪些資料我「確認收到」（ack_ranges）
-        
-        #收過了，ACK回去，不交給L7
-        # 如果收到的封包有重疊（但不是完全落後），還是要存進 buffer
-        if seq_range[1] <= self.expected_seq:
-            return [(seq_range[0], seq_range[1])], ""  # 完全收到過的就不要再處理
-
-        
-        #不管怎樣，都先存到buffer中
-        self.buffer[seq_range[0]] = data
-        ack_ranges = [(seq_range[0], seq_range[1])]
-
-        #從buffer裡面拿資料
-        ready_data = ""
-        while self.expected_seq in self.buffer:
-            packet = self.buffer[self.expected_seq]
-            ready_data += packet
-            del self.buffer[self.expected_seq]
-            newExpected = self.expected_seq + len(packet)
-            ack_ranges.append((self.expected_seq, newExpected))
-            self.expected_seq = newExpected  # Increment by the length of the current packet
-        
-        # Acknowledge the range of sequence numbers received
-        return ack_ranges, ready_data
+        # 只要緊鄰 expected，就依序交付並前推 expected
+        delivered = []
+        app_out = ""
+        while self.expected in self.buf:
+            pkt = self.buf.pop(self.expected)
+            app_out += pkt
+            self.expected += len(pkt)
+        return ([(0, self.expected)], app_out)
+    # ----------------------------------------------------------------
 
     def finish(self):
-        # TODO
-        ''' Check if all data has been sent to the application'''
-        if self.buffer:
-            print("Not all data was sent to the application. There might be an issue.")
-        else:
-            print("All data was successfully received and delivered.")
+        # 小作業：簡單一致性檢查
+        if self.buf:
+            print("Receiver warning: data gap remains!")
+        pass
 
 class Sender:
-    def __init__(self, data_len: int,fixed_cwnd: Optional[int] = None):
-        '''`data_len` is the length of the data we want to send. A real
-        transport will not force the application to pre-commit to the
-        length of data, but we are ok with it.
-
-        '''
-        # TODO: Initialize any variables you want here, for instance a
-        self.data_len = data_len # The total amount of data
-        self.next_seq = 0  # The sequence number of the next byte to send
-        self.acknowledged = set()  # Set of acknowledged sequence numbers
-        self.unacknowledged = set()  # Set of unacknowledged sequence numbers
-        self.cumulative_sacks = []
-        self.last_ack_id_seen = {}
+    def __init__(self, data_len: int, fixed_cwnd: int = 120_000):  # <<< changed
+        # --------------------  基本狀態 ---------------------------
+        self.data_len = data_len
+        self.next_seq = 0                 # 將要傳送的 seq
+        self.unacked: Dict[int, int] = {} # seq_start → length
+        self.cwnd_bytes = 120_000         # 固定 120 kB 視窗
+        self.rto = 0.5                    # 常數 RTO
         self.done = False
-        self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
-        
-        self.cwnd = fixed_cwnd
-        self.send_time = {}
-        self.estimated_rtt = 1.0
-        self.dev_rtt = 0.0
-        self.alpha = 1 / 64
-        self.beta = 1 / 4
-        self.rto = 1.0
-        self.retransmit_queue = []
-        self.fixed_cwnd = fixed_cwnd if fixed_cwnd is not None else 1200  # default 1 MSS
-        self.send_queue = []
-
-
-
+        self.cwnd_bytes = fixed_cwnd 
+        self.send_time: Dict[int, float] = {}
+    # ---------------------------------------------------------------
 
     def timeout(self):
-        '''Called when the sender times out.'''
-        # TODO: Initialize any variables you want here, for instance a
-        ''' Called when the sender times out and needs to retransmit '''
-        if self.next_seq >= self.data_len and not self.unacknowledged:
-            self.done = True
+        # ------------  timeout：重傳第一個未 ACK 封包 --------------
+        if not self.unacked:
             return
-
-        # 把最早未 ACK 的封包排回重傳佇列
-        if self.unacknowledged:
-            seq = min(self.unacknowledged)
-            end = min(seq + payload_size, self.data_len)
-            self.retransmit_queue.append((seq, end))
-            self.next_seq = seq                  # 重新從這裡開始傳
-           
-
-
+        first = min(self.unacked)
+        self.next_seq = first
+        self.cwnd_bytes = payload_size    # 慢啟動回 1 MSS
+        self.unacked.pop(first, None)     # 讓 send() 重新送
+    # ---------------------------------------------------------------
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
-        '''Called every time we get an acknowledgment. The argument is a list
-        of ranges of bytes that have been ACKed. Returns the number of
-        payload bytes new that are no longer in flight, either because
-        the packet has been acked (measured by the unique ID) or it
-        has been assumed to be lost because of dupACKs. Note, this
-        number is incremental. For example, if one 100-byte packet is
-        ACKed and another 500-byte is assumed lost, we will return
-        600, even if 1000s of bytes have been ACKed before this.
-
-        '''
-
-        # TODO
-        '''Called every time we get an acknowledgment.'''
-        new_acknowledged = 0
-
-        # 紀錄已被 ack 的封包，並清除其 dup 記錄
-        for start, end in sacks:
-            for seq in range(start, end, payload_size):
-                actual_size = min(payload_size, end - seq)
-                if seq not in self.acknowledged and seq in self.unacknowledged:
-                    self.unacknowledged.remove(seq)
-                    self.acknowledged.add(seq)
-                    new_acknowledged += actual_size
-                    
-                    
-
-                # 根據 packet_id 更新 RTT 與 RTO
-                if packet_id in self.send_time:
-                    sample_rtt = time.time() - self.send_time[packet_id]
-                    self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                    self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-                    self.rto = self.estimated_rtt + 4 * self.dev_rtt
-                    del self.send_time[packet_id]
-
-                self.last_ack_id_seen[seq] = packet_id
-
-            if not sacks:
-                return new_acknowledged
-
-        base_seq = min(start for start, _ in sacks)
-        retransmit_ranges = []
-
-        for seq in list(self.unacknowledged):
-            # 只處理 base_seq 前的封包
-            if seq >= base_seq:
-                continue
-
-            in_sack = any(start <= seq < end for start, end in sacks)
-            if not in_sack:
-                if self.last_ack_id_seen.get(seq) != packet_id:
-                    self.last_ack_id_seen[seq] = packet_id
-
-                   
-
-            else:
-                self.last_ack_id_seen[seq] = packet_id
-
-        # 印 cumulative SACK 狀態
-        ack_list = sorted(self.acknowledged)
-        merged_sacks = []
-        if ack_list:
-            start = ack_list[0]
-            end = start + payload_size
-            for seq in ack_list[1:]:
-                if seq == end:
-                    end += payload_size
-                else:
-                    merged_sacks.append([start, end])
-                    start = seq
-                    end = start + payload_size
-            merged_sacks.append([start, end])
-        print(f"Got ACK sacks: {merged_sacks}, id: {packet_id}")
-
-        # 合併 retransmit 區段
-        retransmit_ranges.sort()
-        merged = []
-        for start, end in retransmit_ranges:
-            if not merged or merged[-1][1] < start:
-                merged.append((start, end))
-            else:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
-        for start, end in merged:
-            print(f"DUP retransmit Sending seq: ({start}, {end})")
-        self.retransmit_queue.extend(merged)
-
-
-        if sacks:
-            self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
-            
-        
-        print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
-        
-        # 判斷是否收到 new ACK 結束 fast recovery
-        
-
-
-
-
-        return new_acknowledged
+        # ----------------  只用累積 ACK 第一段 ---------------------
+        if not sacks:
+            return 0
+        acked_to = sacks[0][1]            # (0, x)
+        newly = 0
+        for seq in list(self.unacked):
+            if seq + self.unacked[seq] <= acked_to:
+                newly += self.unacked.pop(seq)
+        return newly
+    # ---------------------------------------------------------------
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
-        '''Called just before we are going to send a data packet. Should
-        return the range of sequence numbers we should send. If there
-        are no more bytes to send, returns a zero range (i.e. the two
-        elements of the tuple are equal). Return None if there are no
-        more bytes to send, and _all_ bytes have been
-        acknowledged. Note: The range should not be larger than
-        `payload_size` or contain any bytes that have already been
-        acknowledged
-
-        '''
-
-        # TODO
-        # Check if we've reached the end and have no more data to send
-        
-        # 如果有重傳封包要送，優先送這個
+        # -----------------  pipeline 傳送邏輯 ----------------------
         if self.done:
-            return None                       # 全部送完了
+            return None
 
-        # a. 若 queue 已排好封包，就先吐出一包
-        if self.send_queue:
-            return self.send_queue.pop(0)
+        # 若資料全 ACK，結束
+        if self.next_seq >= self.data_len and not self.unacked:
+            self.done = True
+            return None
 
-        # b. 若 queue 空，按照 cwnd 預算一次排滿一整窗
-        inflight = sum(min(self.data_len - s, payload_size)
-                       for s in self.unacknowledged
-                       if s not in self.acknowledged)
-
-        budget = self.get_cwnd() - inflight
-        while budget > 0 and self.next_seq < self.data_len:
-            if self.next_seq in self.acknowledged:          # 已被 ACK，跳過
-                self.next_seq += payload_size
-                continue
-            end = min(self.next_seq + payload_size, self.data_len)
-            self.unacknowledged.add(self.next_seq)
-            self.send_queue.append((self.next_seq, end))
-            budget -= (end - self.next_seq)
-            self.next_seq = end
-
-        # c. 排好之後，立刻回傳第一包；其餘留在 queue
-        if self.send_queue:
-            return self.send_queue.pop(0)
-
-        # d. 若沒東西可送但仍未全 ACK，回傳 (x,x) 讓外層去等 ACK
-        if self.highest_sack < self.data_len:
+        # 若已全部排完但仍有未 ACK -> 返回空區段讓外層等待
+        if self.next_seq >= self.data_len:
             return (self.data_len, self.data_len)
 
-        # e. 全部 ACK 完成
-        self.done = True
-        return None
-    
-    def get_cwnd(self) -> int:
-        # TODO
-        return max(packet_size, int(self.cwnd))
+        # 若 seq 已被列入 unacked，直接跳到下一包
+        while self.next_seq in self.unacked:
+            self.next_seq += payload_size
 
+        # 產生新封包
+        end = min(self.next_seq + payload_size, self.data_len)
+        self.unacked[self.next_seq] = end - self.next_seq
+        rng = (self.next_seq, end)
+        self.next_seq = end
+        return rng
+    # ---------------------------------------------------------------
+
+    def get_cwnd(self) -> int:
+        return max(packet_size, self.cwnd_bytes)
 
     def get_rto(self) -> float:
-        # TODO
-        return max(0.001, self.rto)
+        return self.rto
+
+
+
+
+
 
 
 def start_receiver(ip: str, port: int):
