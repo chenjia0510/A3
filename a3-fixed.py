@@ -103,15 +103,12 @@ class Sender:
             self.done = True
             return
 
+        # 把最早未 ACK 的封包排回重傳佇列
         if self.unacknowledged:
-            # timeout 時重傳最早還沒 ack 的封包
             seq = min(self.unacknowledged)
-            end_seq = min(seq + payload_size, self.data_len)
-            print(f"[TIMEOUT] Retransmitting seq: ({seq}, {end_seq})")
-            self.retransmit_queue.append((seq, end_seq))
-            self.next_seq = seq  # 指針回到這邊保證下一輪會送出
-                # 觸發 AIMD 的 multiplicative decrease
-
+            end = min(seq + payload_size, self.data_len)
+            self.retransmit_queue.append((seq, end))
+            self.next_seq = seq                  # 重新從這裡開始傳
            
 
 
@@ -235,41 +232,40 @@ class Sender:
         
         # 如果有重傳封包要送，優先送這個
         if self.done:
-            return None
+            return None                       # 全部送完了
 
-        # 1. 若有排好的 queue，直接吐出（pipeline 中的一包）
-        if hasattr(self, "send_queue") and self.send_queue:
-            return self.send_queue.pop(0)
-
-        # 2. 建立 send_queue（pipeline），把 cwnd 容許範圍內的包先放進來
-        inflight_bytes = sum([
-            min(self.data_len - seq, payload_size)
-            for seq in self.unacknowledged
-            if seq not in self.acknowledged
-        ])
-
-        budget = self.get_cwnd() - inflight_bytes
-        self.send_queue = []
-
-        while budget > 0 and self.next_seq < self.data_len:
-            if self.next_seq in self.acknowledged:
-                self.next_seq += payload_size
-                continue
-
-            end_seq = min(self.next_seq + payload_size, self.data_len)
-            self.unacknowledged.add(self.next_seq)
-            self.send_queue.append((self.next_seq, end_seq))
-            budget -= (end_seq - self.next_seq)
-            self.next_seq = end_seq
-
+        # a. 若 queue 已排好封包，就先吐出一包
         if self.send_queue:
             return self.send_queue.pop(0)
 
-        if self.highest_sack >= self.data_len:
-            self.done = True
-            return None
+        # b. 若 queue 空，按照 cwnd 預算一次排滿一整窗
+        inflight = sum(min(self.data_len - s, payload_size)
+                       for s in self.unacknowledged
+                       if s not in self.acknowledged)
 
-        return (self.data_len, self.data_len)
+        budget = self.get_cwnd() - inflight
+        while budget > 0 and self.next_seq < self.data_len:
+            if self.next_seq in self.acknowledged:          # 已被 ACK，跳過
+                self.next_seq += payload_size
+                continue
+            end = min(self.next_seq + payload_size, self.data_len)
+            self.unacknowledged.add(self.next_seq)
+            self.send_queue.append((self.next_seq, end))
+            budget -= (end - self.next_seq)
+            self.next_seq = end
+
+        # c. 排好之後，立刻回傳第一包；其餘留在 queue
+        if self.send_queue:
+            return self.send_queue.pop(0)
+
+        # d. 若沒東西可送但仍未全 ACK，回傳 (x,x) 讓外層去等 ACK
+        if self.highest_sack < self.data_len:
+            return (self.data_len, self.data_len)
+
+        # e. 全部 ACK 完成
+        self.done = True
+        return None
+    
     def get_cwnd(self) -> int:
         # TODO
         return max(packet_size, int(self.cwnd))
