@@ -81,10 +81,7 @@ class Sender:
         self.cumulative_sacks = []
         self.last_ack_id_seen = {}
         self.done = False
-        self.dup_ack_count: dict[int, int]    = {}      # ← 新增
-        self.last_ack_id_seen: dict[int, int] = {}      # ← 新增
         self.highest_sack: int = 0                      # ← 新增        
-        self.retransmit_queue: list[tuple[int, int]] = []
 
         self.send_time = {}
         self.estimated_rtt = 1.0
@@ -98,18 +95,7 @@ class Sender:
         '''Called when the sender times out.'''
         # TODO: Initialize any variables you want here, for instance a
         ''' Called when the sender times out and needs to retransmit '''
-        if self.next_seq >= self.data_len and not self.unacknowledged:
-            self.done = True  #通知主程式傳送真的結束
-            return
 
-        if self.unacknowledged:
-            # timeout 時選擇最早未被 ack 的封包重傳
-            self.next_seq = min(self.unacknowledged)
-
-            # 觸發 AIMD 的 multiplicative decrease
-
-            self.dup_ack_count.clear()  
-            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reset to {self.cwnd}, ssthresh = {self.ssthresh}")
 
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
@@ -147,14 +133,12 @@ class Sender:
                     self.rto = self.estimated_rtt + 4 * self.dev_rtt
                     del self.send_time[packet_id]
 
-                self.dup_ack_count.pop(seq, None)
-                self.last_ack_id_seen[seq] = packet_id
+
 
             if not sacks:
                 return new_acknowledged
 
         base_seq = min(start for start, _ in sacks)
-        retransmit_ranges = []
 
         for seq in list(self.unacknowledged):
             # 只處理 base_seq 前的封包
@@ -162,18 +146,12 @@ class Sender:
                 continue
 
             in_sack = any(start <= seq < end for start, end in sacks)
-            if not in_sack:
-                if self.last_ack_id_seen.get(seq) != packet_id:
-                    self.dup_ack_count[seq] = self.dup_ack_count.get(seq, 0) + 1
-                    self.last_ack_id_seen[seq] = packet_id
+
                     
 
 
 
 
-            else:
-                self.dup_ack_count.pop(seq, None)
-                self.last_ack_id_seen[seq] = packet_id
 
         # 印 cumulative SACK 狀態
         ack_list = sorted(self.acknowledged)
@@ -191,18 +169,6 @@ class Sender:
             merged_sacks.append([start, end])
         print(f"Got ACK sacks: {merged_sacks}, id: {packet_id}")
 
-        # 合併 retransmit 區段
-        retransmit_ranges.sort()
-        merged = []
-        for start, end in retransmit_ranges:
-            if not merged or merged[-1][1] < start:
-                merged.append((start, end))
-            else:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-
-        for start, end in merged:
-            print(f"DUP retransmit Sending seq: ({start}, {end})")
-        self.retransmit_queue.extend(merged)
 
 
         if sacks:
@@ -233,11 +199,7 @@ class Sender:
         # Check if we've reached the end and have no more data to send
         
         # 如果有重傳封包要送，優先送這個
-        if self.retransmit_queue:
-            start, end = self.retransmit_queue.pop(0)
-            if start not in self.acknowledged:
-                self.unacknowledged.add(start)
-                return (start, end)
+
         
         if self.done:
             return None 
