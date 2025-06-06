@@ -472,7 +472,11 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
+            start_time = time.time()
             start_sender(args.ip, args.port, data, args.recv_window, args.simloss,1,fixed_bytes)
+            end_time = time.time()
+            print(f"[測量時間] 傳送時間 = {end_time - start_time:.3f} 秒")
+
 
 if __name__ == "__main__":
     main()
