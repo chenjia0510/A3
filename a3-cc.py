@@ -82,13 +82,16 @@ class Sender:
         self.done = False
         self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
         
-        self.cwnd = packet_size
+        self.cwnd = payload_size
         self.send_time = {}
         self.estimated_rtt = 1.0
         self.dev_rtt = 0.0
         self.alpha = 1 / 64
         self.beta = 1 / 4
         self.rto = 1.0
+        self.state = "slow_start"
+        self.ssthresh = 64000
+
 
 
     def timeout(self):
@@ -106,8 +109,12 @@ class Sender:
             # 觸發 AIMD 的 multiplicative decrease
             self.cwnd = max(payload_size, self.cwnd / 2)
 
-            # 印 log 幫助 debug
-            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reduced to {self.cwnd:.2f}")
+            # ✅ 對應 FSM 圖片 (18)(20)(21)
+            self.ssthresh = max(self.cwnd / 2, payload_size)
+            self.cwnd = payload_size  # = 1 MSS
+            self.state = "slow_start"  # ✅ 必加！否則會卡住
+            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reset to {self.cwnd}, ssthresh = {self.ssthresh}")
+
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -134,8 +141,15 @@ class Sender:
                     self.acknowledged.add(seq)
                     new_acknowledged += actual_size
                     
-                    #  Additive Increase：每收到一個新 ack，增加 cwnd
-                    self.cwnd += (payload_size * payload_size) / self.cwnd
+                        # ✅ 根據不同階段更新 cwnd
+                    if self.state == "slow_start":
+                        self.cwnd += payload_size
+                        # 若超過 ssthresh，就轉換到 congestion_avoidance
+                        if self.cwnd >= self.ssthresh:
+                            self.state = "congestion_avoidance"
+                            print(f"[Exit Slow Start] cwnd = {self.cwnd:.2f}, ssthresh = {self.ssthresh:.2f}")
+                    elif self.state == "congestion_avoidance":
+                        self.cwnd += (payload_size * payload_size) / self.cwnd
 
                 # 根據 packet_id 更新 RTT 與 RTO
                 if packet_id in self.send_time:
@@ -165,9 +179,13 @@ class Sender:
                     self.dup_ack_count[seq] = self.dup_ack_count.get(seq, 0) + 1
                     self.last_ack_id_seen[seq] = packet_id
 
-                    if self.dup_ack_count[seq] % 3 == 0:
+                    if self.dup_ack_count[seq] == 3 and self.state != "fast_recovery":
+                        self.ssthresh = self.cwnd / 2
+                        self.cwnd = min(self.ssthresh + 3 * payload_size, 60000)
+                        self.state = "fast_recovery"
+                        print("[Fast Recovery] Entered, cwnd =", self.cwnd)
                         retransmit_ranges.append((seq, seq + payload_size))
-                        self.next_seq = min(self.next_seq, seq)
+
             else:
                 self.dup_ack_count.pop(seq, None)
                 self.last_ack_id_seen[seq] = packet_id
@@ -206,6 +224,17 @@ class Sender:
             
         # ✅ 印出目前 cwnd 和 rto 狀態
         print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
+        
+        # 判斷是否收到 new ACK 結束 fast recovery
+        if self.state == "fast_recovery":
+                # Fast recovery exit 判斷新 ACK 的方式是：這個 ACK 把 highest_sack 往前推了
+                if self.highest_sack < max(end for _, end in sacks):
+                    self.cwnd = self.ssthresh
+                    self.state = "congestion_avoidance"
+                    print(f"[Fast Recovery Exit] cwnd reset to ssthresh = {self.cwnd}")
+            
+
+
 
         return new_acknowledged
 
@@ -346,6 +375,8 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
     sender = Sender(len(data))
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
+        buf_size = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+        print("Current socket recv buffer size:", buf_size)
         # So we can receive messages
         client_socket.connect((ip, port))
         # When waiting for packets when we call receivefrom, we
