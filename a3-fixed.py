@@ -81,7 +81,7 @@ class Sender:
         self.done = False
         self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
         
-        self.cwnd = payload_size
+        self.cwnd = fixed_cwnd
         self.send_time = {}
         self.estimated_rtt = 1.0
         self.dev_rtt = 0.0
@@ -361,8 +361,8 @@ def start_receiver(ip: str, port: int):
                 assert False
 
 
-def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float, pkts_to_reorder: int):
-    sender = Sender(len(data), fixed_cwnd=36000)
+def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float, pkts_to_reorder: int, fixed_cwnd: int):
+    sender = Sender(len(data), fixed_cwnd=fixed_cwnd)
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
         buf_size = client_socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
@@ -489,6 +489,7 @@ def main():
     parser.add_argument("--sendfile", type=str, required=False, help="If role=sender, the file that contains data to send")
     parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
     parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
+    parser.add_argument("--fixed_cwnd", type=int, default=30000, help="Fixed congestion window size (in bytes)")
 
 
 
@@ -503,7 +504,7 @@ def main():
 
         with open(args.sendfile, 'r') as f:
             data = f.read()
-            start_sender(args.ip, args.port, data, args.recv_window, args.simloss,1)
+            start_sender(args.ip, args.port, data, args.recv_window, args.simloss,1, args.fixed_cwnd)
 
 if __name__ == "__main__":
     main()
