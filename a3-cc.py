@@ -184,6 +184,7 @@ class Sender:
                     if self.state == "fast_recovery":
                         self.cwnd += payload_size
 
+
                     if self.dup_ack_count[seq] == 3 and self.state != "fast_recovery":
                         self.ssthresh = self.cwnd / 2
                         self.cwnd = self.ssthresh + 3 * payload_size
