@@ -41,20 +41,35 @@ class Receiver:
         
         #不管怎樣，都先存到buffer中
         self.buffer[seq_range[0]] = data
-        ack_ranges = [(seq_range[0], seq_range[1])]
 
-        #從buffer裡面拿資料
+        # 從buffer裡面拿資料
         ready_data = ""
         while self.expected_seq in self.buffer:
             packet = self.buffer[self.expected_seq]
             ready_data += packet
             del self.buffer[self.expected_seq]
-            newExpected = self.expected_seq + len(packet)
-            ack_ranges.append((self.expected_seq, newExpected))
-            self.expected_seq = newExpected  # Increment by the length of the current packet
-        
-        # Acknowledge the range of sequence numbers received
-        return ack_ranges, ready_data
+            self.expected_seq += len(packet)
+
+        # 合併所有已收到的區間
+        keys = sorted(self.buffer.keys())
+        ranges = []
+        last_start = None
+        last_end = None
+        # 先把已 deliver 的區間加進去
+        if self.expected_seq > 0:
+            ranges.append((0, self.expected_seq))
+        for k in keys:
+            seg_len = len(self.buffer[k])
+            if last_end is None or k > last_end:
+                # 新區間
+                last_start = k
+                last_end = k + seg_len
+                ranges.append((last_start, last_end))
+            else:
+                # 連續區間合併
+                last_end = max(last_end, k + seg_len)
+                ranges[-1] = (last_start, last_end)
+        return ranges, ready_data
 
     def finish(self):
         # TODO
