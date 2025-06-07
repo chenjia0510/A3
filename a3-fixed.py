@@ -102,6 +102,8 @@ class Sender:
         self.rto = min(self.rto * 2, 4.0)          # 最長 4 秒
         if self.unacknowledged:
             self.next_seq = min(self.unacknowledged)   # 重新發最早缺洞
+        print("[TIMEOUT] RTO backed-off, retransmitting from seq", self.next_seq, flush=True)
+
 
 
 
@@ -141,9 +143,10 @@ class Sender:
             base_seq = min(s[0] for s in sacks)
             for seq in list(self.unacknowledged):
                 if seq < base_seq and all(not (s <= seq < e) for s, e in sacks):
-                    self.unacknowledged.remove(seq)
                     new_ack += payload_size          # 視為 lost，從 inflight 扣掉
 
+
+        print(f"[ACK  ] sacks={sacks}  newly_freed={new_ack}  still_unacked={len(self.unacknowledged)}", flush=True)
         return new_ack
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
@@ -187,6 +190,7 @@ class Sender:
         end_seq = min(self.next_seq + payload_size, self.data_len)
         self.unacknowledged.add(self.next_seq)
         seq_range = (self.next_seq, end_seq)
+        print(f"[SEND ] seq_range={seq_range}  inflight={packet_id * payload_size}  cwnd={self.cwnd}", flush=True)
         self.next_seq = end_seq
         return seq_range
 
