@@ -180,6 +180,9 @@ class Sender:
                 if self.last_ack_id_seen.get(seq) != packet_id:
                     self.dup_ack_count[seq] = self.dup_ack_count.get(seq, 0) + 1
                     self.last_ack_id_seen[seq] = packet_id
+                    
+                    if self.state == "fast_recovery":
+                        self.cwnd += payload_size
 
                     if self.dup_ack_count[seq] == 3 and self.state != "fast_recovery":
                         self.ssthresh = self.cwnd / 2
