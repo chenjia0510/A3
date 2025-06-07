@@ -348,6 +348,9 @@ def start_receiver(ip: str, port: int):
 def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float):
     sender = Sender(len(data))
 
+    # 隨機產生一個 log 檔名
+    log_filename = f"cwnd_log_{random.randint(10000,99999)}.txt"
+
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
         # So we can receive messages
         client_socket.connect((ip, port))
@@ -361,6 +364,9 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
         packet_id  = 0
         wait = False
 
+        log_list = []
+        counter = 0
+
         while True:
             # Get the congestion window and rto
             cwnd = sender.get_cwnd()
@@ -368,9 +374,12 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
             now = time.time()
             print(f"[LOG] time={now:.3f}, cwnd={cwnd}, rto={rto:.4f}")
 
-            # 新增：把 log 寫進檔案
-            with open("cwnd_log.txt", "a") as f:
-                f.write(f"{now:.6f},{cwnd},{rto:.6f}\n")
+            log_list.append(f"{now:.2f},{cwnd},{rto:.2f}\n")
+            counter += 1
+            if counter % 1000 == 0:
+                with open(log_filename, "a") as f:
+                    f.writelines(log_list)
+                log_list = []
 
             # Do we have enough room in recv_window to send an entire
             # packet?
@@ -420,6 +429,10 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                     inflight = 0
                     print("Timeout")
                     sender.timeout()
+
+        # 程式結束時再寫一次
+        with open(log_filename, "a") as f:
+            f.writelines(log_list)
 
 def main():
     parser = argparse.ArgumentParser(description="Transport assignment")
