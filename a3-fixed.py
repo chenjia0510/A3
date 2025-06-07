@@ -37,26 +37,30 @@ class Receiver:
         
         #收過了，ACK回去，不交給L7
         # 如果收到的封包有重疊（但不是完全落後），還是要存進 buffer
-        if seq_range[1] <= self.expected_seq:
-            return [(seq_range[0], seq_range[1])], ""  # 完全收到過的就不要再處理
+        start, end = seq_range
 
-        
-        #不管怎樣，都先存到buffer中
-        self.buffer[seq_range[0]] = data
-        ack_ranges = [(seq_range[0], seq_range[1])]
+        # （1）完全收到過 → 直接 ACK，不交給 L7
+        if end <= self.expected_seq:
+            return [(start, end)], ""
 
-        #從buffer裡面拿資料
-        ready_data = ""
+        # （2）若跟已交付區段重疊，裁掉前面已收到的部分
+        if start < self.expected_seq:
+            offset = self.expected_seq - start
+            start = self.expected_seq
+            data = data[offset:]
+
+        # （3）存進 buffer（後寫覆蓋前寫，可保留最晚收到的版本）
+        self.buffer[start] = data
+        ack_ranges = [(start, start + len(data))]
+
+        # （4）把 buffer 內連續可交付的資料一路吐給應用層
+        ready_data = []
         while self.expected_seq in self.buffer:
-            packet = self.buffer[self.expected_seq]
-            ready_data += packet
-            del self.buffer[self.expected_seq]
-            newExpected = self.expected_seq + len(packet)
-            ack_ranges.append((self.expected_seq, newExpected))
-            self.expected_seq = newExpected  # Increment by the length of the current packet
-        
-        # Acknowledge the range of sequence numbers received
-        return ack_ranges, ready_data
+            pkt = self.buffer.pop(self.expected_seq)
+            ready_data.append(pkt)
+            self.expected_seq += len(pkt)
+
+        return ack_ranges, "".join(ready_data)
 
     def finish(self):
         # TODO
@@ -95,6 +99,9 @@ class Sender:
         '''Called when the sender times out.'''
         # TODO: Initialize any variables you want here, for instance a
         ''' Called when the sender times out and needs to retransmit '''
+        self.rto = min(self.rto * 2, 4.0)          # 最長 4 秒
+        if self.unacknowledged:
+            self.next_seq = min(self.unacknowledged)   # 重新發最早缺洞
 
 
 
@@ -112,76 +119,32 @@ class Sender:
 
         # TODO
         '''Called every time we get an acknowledgment.'''
-        new_acknowledged = 0
+        new_ack = 0
 
-        # 紀錄已被 ack 的封包，並清除其 dup 記錄
+        # 3-a. 標記 SACK 內的封包為已收到
         for start, end in sacks:
             for seq in range(start, end, payload_size):
-                actual_size = min(payload_size, end - seq)
-                if seq not in self.acknowledged and seq in self.unacknowledged:
+                if seq in self.unacknowledged:
                     self.unacknowledged.remove(seq)
                     self.acknowledged.add(seq)
-                    new_acknowledged += actual_size
-                    
-                    
+                    new_ack += min(payload_size, end - seq)
 
-                # 根據 packet_id 更新 RTT 與 RTO
-                if packet_id in self.send_time:
-                    sample_rtt = time.time() - self.send_time[packet_id]
-                    self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                    self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-                    self.rto = self.estimated_rtt + 4 * self.dev_rtt
-                    del self.send_time[packet_id]
+        # 3-b. RTT / RTO 更新（只用觸發這個 ACK 的 packet_id）
+        if packet_id in self.send_time:
+            sample = time.time() - self.send_time.pop(packet_id)
+            self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample
+            self.dev_rtt       = (1 - self.beta)  * self.dev_rtt       + self.beta  * abs(sample - self.estimated_rtt)
+            self.rto           = self.estimated_rtt + 4 * self.dev_rtt
 
-
-
-            if not sacks:
-                return new_acknowledged
-
-        base_seq = min(start for start, _ in sacks)
-
-        for seq in list(self.unacknowledged):
-            # 只處理 base_seq 前的封包
-            if seq >= base_seq:
-                continue
-
-            in_sack = any(start <= seq < end for start, end in sacks)
-
-                    
-
-
-
-
-
-        # 印 cumulative SACK 狀態
-        ack_list = sorted(self.acknowledged)
-        merged_sacks = []
-        if ack_list:
-            start = ack_list[0]
-            end = start + payload_size
-            for seq in ack_list[1:]:
-                if seq == end:
-                    end += payload_size
-                else:
-                    merged_sacks.append([start, end])
-                    start = seq
-                    end = start + payload_size
-            merged_sacks.append([start, end])
-        print(f"Got ACK sacks: {merged_sacks}, id: {packet_id}")
-
-
-
+        # 3-c. 把 SACK 之前但「不在 SACK 裡」的封包視為遺失 → 釋放 in-flight
         if sacks:
-            self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
-            
-        
-        print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
-        
+            base_seq = min(s[0] for s in sacks)
+            for seq in list(self.unacknowledged):
+                if seq < base_seq and all(not (s <= seq < e) for s, e in sacks):
+                    self.unacknowledged.remove(seq)
+                    new_ack += payload_size          # 視為 lost，從 inflight 扣掉
 
-
-
-
-        return new_acknowledged
+        return new_ack
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         '''Called just before we are going to send a data packet. Should
@@ -202,24 +165,25 @@ class Sender:
 
         
         if self.done:
-            return None 
-        
+            return None
+
+        # 4-a. 先找最早缺洞重傳（降低 head-of-line blocking）
+        for seq in sorted(self.unacknowledged):
+            if seq not in self.acknowledged:
+                end = min(seq + payload_size, self.data_len)
+                return (seq, end)
+
+        # 4-b. 沒缺洞，傳新資料
         if self.next_seq >= self.data_len:
-            if self.highest_sack >= self.data_len:
+            if max(self.acknowledged, default=-1) + payload_size >= self.data_len:
                 self.done = True
                 return None
-            else:
-                return (self.data_len, self.data_len)
+            return (self.data_len, self.data_len)   # 等待 ACK
 
-        # Find the next Unacked seq and send it
+        # 跳過已 ACK 區段
         while self.next_seq in self.acknowledged:
-            self.next_seq = min(self.next_seq + payload_size, self.data_len)
-            
-            
-        # 防止送出已經被 ack 的區段
-        if self.next_seq in self.acknowledged:
-            return None    
-        
+            self.next_seq += payload_size
+
         end_seq = min(self.next_seq + payload_size, self.data_len)
         self.unacknowledged.add(self.next_seq)
         seq_range = (self.next_seq, end_seq)
@@ -228,7 +192,7 @@ class Sender:
 
     def get_cwnd(self) -> int:
         # TODO
-        return max(packet_size, int(self.cwnd))
+        return int(self.cwnd)
 
 
     def get_rto(self) -> float:
@@ -377,7 +341,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         inflight = 0
                         print("Timeout")
                         sender.timeout()
-                        exit(1)
+                        return
                     if got_fin_ack:
                         break
                     else:
@@ -417,6 +381,7 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
 
                 packet_len = seq[1] - seq[0]
                 if inflight + packet_len > sender.get_cwnd():
+                    print(f"[PAUSE] inflight={inflight}  cwnd={sender.get_cwnd()}")
                     wait = True
                     continue
                 inflight += packet_len
@@ -454,14 +419,14 @@ def main():
     parser.add_argument("--sendfile", type=str, required=False, help="If role=sender, the file that contains data to send")
     parser.add_argument("--recv_window", type=int, default=15000000, help="Receive window size in bytes")
     parser.add_argument("--simloss", type=float, default=0.0, help="Simulate packet loss. Provide the fraction of packets (0-1) that should be randomly dropped")
-    parser.add_argument("--fixed_cwnd", type=int, default=1,
+    parser.add_argument("--fixed_cwnd", type=float, default=1,
                         help="固定 cwnd，單位＝幾個 BDP (1 BDP = 30,000 bytes)")
 
 
 
     args = parser.parse_args()
     
-    fixed_bytes = 30000 * args.fixed_cwnd
+    fixed_bytes = int(30000 * args.fixed_cwnd)
 
     if args.role == "receiver":
         start_receiver(args.ip, args.port)
