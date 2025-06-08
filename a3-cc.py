@@ -349,69 +349,92 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
     sender = Sender(len(data))
 
     # 隨機產生一個 log 檔名
-    log_filename = f"cwnd_log_{random.randint(10000,99999)}.txt"
+    log_filename = f"cwnd_log_{random.randint(10000,99999)}.csv"
 
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
-        # So we can receive messages
         client_socket.connect((ip, port))
-        # When waiting for packets when we call receivefrom, we
-        # shouldn't wait more than 500ms
 
-        # Number of bytes that we think are inflight. We are only
-        # including payload bytes here, which is different from how
-        # TCP does things
         inflight = 0
         packet_id  = 0
         wait = False
 
         log_list = []
         counter = 0
+        last_sent_bytes = 0  # 新增：記錄單次送出量
+
+        # 先寫欄位名稱
+        with open(log_filename, "w") as f:
+            f.write("time,cwnd,rto,last_sent_bytes,status,loss_flag,state\n")
+
+        # 新增：說明每個欄位
+        print("欄位說明：")
+        print("time: 時間戳(秒) | cwnd: 擁塞視窗(bytes) | rto: 超時重傳時間(s) | sent_bytes: 單次送出量(bytes) | status: send/wait | loss: 是否隨機丟包 | state: ss=slow start, ca=congestion avoidance")
+        print(f"{'time':>10} {'cwnd':>8} {'rto':>8} {'sent_bytes':>10} {'status':>8} {'loss':>6} {'state':>4}")
 
         while True:
             # Get the congestion window and rto
             cwnd = sender.get_cwnd()
             rto = sender.get_rto()
             now = time.time()
-            print(f"[LOG] time={now:.3f}, cwnd={cwnd}, rto={rto:.4f}")
 
-            log_list.append(f"{now:.2f},{cwnd},{rto:.2f}\n")
-            counter += 1
-            if counter % 1000 == 0:
-                with open(log_filename, "a") as f:
-                    f.writelines(log_list)
-                log_list = []
+            # 狀態標記
+            status = "send" if inflight + packet_size <= min(recv_window, cwnd) and not wait else "wait"
+            state = "ss" if sender.cwnd < sender.ssthresh else "ca"
+            loss_flag = 0
 
-            # Do we have enough room in recv_window to send an entire
-            # packet?
             if inflight + packet_size <= min(recv_window, cwnd) and not wait:
                 seq = sender.send(packet_id)
                 if seq is None:
-                    # We are done sending
                     client_socket.send('{"type": "fin"}'.encode())
                     break
                 elif seq[1] == seq[0]:
-                    # No more packets to send until loss happens. Wait
                     wait = True
+                    last_sent_bytes = 0
+                    log_line = f"{now:.2f},{cwnd},{rto:.2f},{last_sent_bytes},{status},{loss_flag},{state}\n"
+                    log_list.append(log_line)
+                    # 新增：逐欄說明格式印出（不顯示 loss）
+                    print(f"time: {now:.2f} | cwnd: {cwnd} | rto: {rto:.2f} | sent_bytes: {last_sent_bytes} | status: {status} | state: {state}")
+                    counter += 1
                     continue
 
                 assert seq[1] - seq[0] <= payload_size
                 assert seq[1] <= len(data)
 
-                # Simulate random loss before sending packets
                 if random.random() < simloss:
-                    pass
+                    last_sent_bytes = 0
+                    loss_flag = 1
                 else:
-                    # Send the packet
                     client_socket.send(
                         json.dumps(
                             {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
                         ).encode())
+                    last_sent_bytes = seq[1] - seq[0]
 
                 inflight += seq[1] - seq[0]
                 packet_id += 1
 
+                log_line = f"{now:.2f},{cwnd},{rto:.2f},{last_sent_bytes},{status},{loss_flag},{state}\n"
+                log_list.append(log_line)
+                # 新增：逐欄說明格式印出（不顯示 loss）
+                print(f"time: {now:.2f} | cwnd: {cwnd} | rto: {rto:.2f} | sent_bytes: {last_sent_bytes} | status: {status} | state: {state}")
+                counter += 1
+                if counter % 1000 == 0:
+                    with open(log_filename, "a") as f:
+                        f.writelines(log_list)
+                    log_list = []
+
             else:
                 wait = False
+                last_sent_bytes = 0
+                log_line = f"{now:.2f},{cwnd},{rto:.2f},{last_sent_bytes},wait,0,{state}\n"
+                log_list.append(log_line)
+                # 新增：逐欄說明格式印出（不顯示 loss）
+                print(f"time: {now:.2f} | cwnd: {cwnd} | rto: {rto:.2f} | sent_bytes: {last_sent_bytes} | status: wait | state: {state}")
+                counter += 1
+                if counter % 1000 == 0:
+                    with open(log_filename, "a") as f:
+                        f.writelines(log_list)
+                    log_list = []
                 # Wait for ACKs
                 try:
                     rto = sender.get_rto()
