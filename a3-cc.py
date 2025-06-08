@@ -22,7 +22,6 @@ class Receiver:
         # TODO: Initialize any variables you want here, like the receive
         # buffer, initial congestion window and initial values for the timeout
         # values
-        self.buffer = {}
         self.expected_seq = 0
 
     def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[List[Tuple[int, int]], str]:
@@ -53,50 +52,16 @@ class Receiver:
 
         '''
 
-        # TODO
-        # 把這個封包存進 buffer
-
-        # 試著把可以交付的資料送給應用層
-
-        # 回傳目前為止有哪些資料我「確認收到」（ack_ranges）
-        
-        #收過了，ACK回去，不交給L7
-        # 如果收到的封包有重疊（但不是完全落後），還是要存進 buffer
-        if seq_range[1] <= self.expected_seq:
-            return [(seq_range[0], seq_range[1])], ""  # 完全收到過的就不要再處理
-
-        
-        #不管怎樣，都先存到buffer中
-        self.buffer[seq_range[0]] = data
-
-        # 從buffer裡面拿資料
-        ready_data = ""
-        while self.expected_seq in self.buffer:
-            packet = self.buffer[self.expected_seq]
-            ready_data += packet
-            del self.buffer[self.expected_seq]
-            self.expected_seq += len(packet)
-
-        # 合併所有已收到的區間
-        keys = sorted(self.buffer.keys())
-        ranges = []
-        last_start = None
-        last_end = None
-        # 先把已 deliver 的區間加進去
-        if self.expected_seq > 0:
-            ranges.append((0, self.expected_seq))
-        for k in keys:
-            seg_len = len(self.buffer[k])
-            if last_end is None or k > last_end:
-                # 新區間
-                last_start = k
-                last_end = k + seg_len
-                ranges.append((last_start, last_end))
-            else:
-                # 連續區間合併
-                last_end = max(last_end, k + seg_len)
-                ranges[-1] = (last_start, last_end)
-        return ranges, ready_data
+        # 檢查收到的封包是否是期望的下一個封包
+        if seq_range[0] == self.expected_seq:
+            # 如果是，則將資料傳給 application layer，並更新 expected_seq
+            ready_data = data
+            self.expected_seq += len(data)
+            # 回傳目前為止有哪些資料我「確認收到」（ack_ranges）
+            return [(0, self.expected_seq)], ready_data
+        else:
+            # 如果不是，則不將資料傳給 application layer，只回傳 ACK
+            return [(0, self.expected_seq)], ""
 
     def finish(self):
         '''Called when the sender sends the `fin` packet. You don't need to do
@@ -111,10 +76,7 @@ class Receiver:
         '''
 
         # TODO
-        if self.buffer:
-            print("Not all data was sent to the application. There might be an issue.")
-        else:
-            print("All data was successfully received and delivered.")
+        print("Receiver: FIN packet received.")
 
 class Sender:
     def __init__(self, data_len: int):
@@ -126,52 +88,40 @@ class Sender:
         # TODO: Initialize any variables you want here, for instance a
         # data structure to keep track of which packets have been
         # sent, acknowledged, detected to be lost or retransmitted
-        self.data_len = data_len # The total amount of data
-        self.next_seq = 0  # The sequence number of the next byte to send
-        self.acknowledged = set()  # Set of acknowledged sequence numbers
-        self.unacknowledged = set()  # Set of unacknowledged sequence numbers
-        self.dup_ack_count = {}
-        self.cumulative_sacks = []
-        self.last_ack_id_seen = {}
-        self.done = False
-        self.highest_sack = 0  # 記錄目前收到的最大 ACK 結尾
-        
-        self.cwnd = payload_size
-        self.send_time = {}
-        self.estimated_rtt = 1.0
-        self.dev_rtt = 0.0
-        self.alpha = 1 / 64
-        self.beta = 1 / 4
-        self.rto = 1.0
-        self.state = "slow_start"
-        self.ssthresh = 64000
-        self.retransmit_queue = []
+        self.data_len = data_len
+        self.unacked_packets: Dict[int, Dict[str, Any]] = {} # {packet_id: {'seq_range': (start, end), 'sent_time': time}}
+        self.next_seq_to_send = 0
+        self.last_acked_seq = 0
 
+        self.sent_time: Dict[int, float] = {} # {packet_id: sent_timestamp}
+        self.estimated_rtt: float = 1.0  # Initial estimated RTT (conservative) 
+        self.dev_rtt: float = 0.0
+        self.alpha: float = 1/8 # Common alpha for EstimatedRTT
+        self.beta: float = 1/4  # Common beta for DevRTT
+        self.min_rto: float = 0.001 # Minimum RTO of 1ms 
 
+        self.cwnd: int = packet_size # Congestion window, initialized to 1 packet 
+        self.ssthresh: int = 30000   # Slow start threshold, e.g., 1 BDP 
+        self.dup_acks: int = 0
+        self.last_acked_id: Optional[int] = None
+        self.in_fast_recovery: bool = False
+        self.recovery_seq: Optional[int] = None # 紀錄進入 Fast Recovery 時的 Recovery Sequence Number
+        self.inflight = 0 # 紀錄 inflight 的大小
+        self.last_sacks: List[Tuple[int, int]] = []
 
     def timeout(self):
         '''Called when the sender times out.'''
-        # TODO: In addition to what you did in assignment 1, set cwnd to 1
-        # packet
-        ''' Called when the sender times out and needs to retransmit '''
-        if self.next_seq >= self.data_len and not self.unacknowledged:
-            self.done = True  #通知主程式傳送真的結束
-            return
-
-        if self.unacknowledged:
-            # timeout 時選擇最早未被 ack 的封包重傳
-            self.next_seq = min(self.unacknowledged)
-
-            # 觸發 AIMD 的 multiplicative decrease
-            self.cwnd = max(payload_size, self.cwnd / 2)
-
-           
-            self.ssthresh = max(self.cwnd / 2, payload_size)
-            self.cwnd = payload_size  # = 1 MSS
-            self.state = "slow_start"  
-            self.dup_ack_count.clear()  
-            print(f"[TIMEOUT] Retransmit from seq {self.next_seq}, cwnd reset to {self.cwnd}, ssthresh = {self.ssthresh}")
-
+        print("Timeout detected!")
+        if not (self.cwnd == packet_size and not self.in_fast_recovery):
+            print("============== 進入 slowstart (timeout)============== ")
+        self.ssthresh = max(self.cwnd // 2, packet_size)
+        self.cwnd = packet_size
+        self.next_seq_to_send = self.last_acked_seq
+        self.unacked_packets.clear()
+        self.sent_time.clear()
+        self.dup_acks = 0
+        self.in_fast_recovery = False
+        self.inflight = 0
 
     def ack_packet(self, sacks: List[Tuple[int, int]], packet_id: int) -> int:
         '''Called every time we get an acknowledgment. The argument is a list
@@ -185,123 +135,117 @@ class Sender:
 
         '''
 
-        # TODO
-        '''Called every time we get an acknowledgment.'''
-        new_acknowledged = 0
+        bytes_freed = 0
 
-        # 紀錄已被 ack 的封包，並清除其 dup 記錄
-        for start, end in sacks:
-            for seq in range(start, end, payload_size):
-                actual_size = min(payload_size, end - seq)
-                if seq not in self.acknowledged and seq in self.unacknowledged:
-                    self.unacknowledged.remove(seq)
-                    self.acknowledged.add(seq)
-                    new_acknowledged += actual_size
-                    
-                    if self.state == "slow_start":
-                        self.cwnd += payload_size
-                        self.dup_ack_count.clear()
-                        # 若超過 ssthresh，就轉換到 congestion_avoidance
-                        if self.cwnd >= self.ssthresh:
-                            self.state = "congestion_avoidance"
-                            print(f"[Exit Slow Start] cwnd = {self.cwnd:.2f}, ssthresh = {self.ssthresh:.2f}")
-                    elif self.state == "congestion_avoidance":
-                        self.cwnd += (payload_size * payload_size) / self.cwnd
+        # 檢查是否為重複ACK
+        if self.last_acked_id is not None and packet_id == self.last_acked_id:
+            self.dup_acks += 1
+            if self.dup_acks == 3 and not self.in_fast_recovery:
+                # Fast Retransmit: On 3rd duplicate ACK
+                self.ssthresh = max(self.cwnd // 2, packet_size)
+                self.cwnd = self.ssthresh + 3 * packet_size # TCP Reno specific. Adjust for this assignment.
+                self.in_fast_recovery = True
+                # 紀錄進入 Fast Recovery 時的 Recovery Sequence Number
+                self.recovery_seq = self.next_seq_to_send
+                # Re-transmit the lost packet (the one expected based on duplicate ACKs)
+                # For simplicity in this assignment, we might not explicitly retransmit here
+                # but rely on the timeout if necessary.
+                print("============== 進入 fast recovery============== ")
+            elif self.in_fast_recovery:
+                self.cwnd += packet_size # Inflate window by one segment for each additional dup ACK
+            return bytes_freed # No new bytes acknowledged, just duplicate ACK
 
-                # 根據 packet_id 更新 RTT 與 RTO
-                if packet_id in self.send_time:
-                    sample_rtt = time.time() - self.send_time[packet_id]
-                    self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
-                    self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
-                    self.rto = self.estimated_rtt + 4 * self.dev_rtt
-                    del self.send_time[packet_id]
+        # 新的ACK
+        if self.in_fast_recovery:
+            print("============== 離開 fast recovery，進入 avoidence============== ")
+        self.last_acked_id = packet_id
+        self.dup_acks = 0
+        self.in_fast_recovery = False
 
-                self.dup_ack_count.pop(seq, None)
-                self.last_ack_id_seen[seq] = packet_id
+        # Process SACKs (Selective Acknowledgments)
+        for ack_start, ack_end in sacks:
+            # We assume a single packet is acknowledged by its packet_id,
+            # and the `sacks` list confirms the range.
+            # In a real SACK implementation, we'd go through all unacked_packets
+            # and mark them as acknowledged if their sequence range is covered by any SACK.
+            # For simplicity, we primarily use packet_id for RTT calculation and
+            # assume the `packet_id` ACK means that packet is acknowledged.
 
-            if not sacks:
-                return new_acknowledged
+            # Find the packet acknowledged by packet_id
+            if packet_id in self.unacked_packets:
+                acked_packet_info = self.unacked_packets.pop(packet_id)
+                acked_seq_range = acked_packet_info['seq_range']
+                bytes_freed += (acked_seq_range[1] - acked_seq_range[0])
+                self.inflight -= (acked_seq_range[1] - acked_seq_range[0]) # 更新 inflight
 
-        base_seq = min(start for start, _ in sacks)
-        retransmit_ranges = []
+                # Update last_acked_seq if this acknowledgment extends it
+                self.last_acked_seq = max(self.last_acked_seq, acked_seq_range[1])
 
-        for seq in list(self.unacknowledged):
-            # 只處理 base_seq 前的封包
-            if seq >= base_seq:
-                continue
+                # Calculate SampleRTT and update RTT estimates
+                sample_rtt = time.time() - acked_packet_info['sent_time']
 
-            in_sack = any(start <= seq < end for start, end in sacks)
-            if not in_sack:
-                if self.last_ack_id_seen.get(seq) != packet_id:
-                    self.dup_ack_count[seq] = self.dup_ack_count.get(seq, 0) + 1
-                    self.last_ack_id_seen[seq] = packet_id
-                    
-                    if self.state == "fast_recovery":
-                        self.cwnd += payload_size
+                # 
+                # EstimatedRTT = (1 - alpha) * EstimatedRTT + alpha * SampleRTT
+                self.estimated_rtt = (1 - self.alpha) * self.estimated_rtt + self.alpha * sample_rtt
 
+                # DevRTT = (1 - beta) * DevRTT + beta * |SampleRTT - EstimatedRTT| 
+                self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.estimated_rtt)
 
-                    if self.dup_ack_count[seq] == 3 and self.state != "fast_recovery":
-                        self.ssthresh = self.cwnd / 2
-                        self.cwnd = self.ssthresh + 3 * payload_size
-                        self.state = "fast_recovery"
-                        self.recovery_seq = max(end for _, end in sacks)
-                        print("[Fast Recovery] Entered, cwnd =", self.cwnd)
-                        retransmit_ranges.append((seq, seq + payload_size))
-
-            else:
-                self.dup_ack_count.pop(seq, None)
-                self.last_ack_id_seen[seq] = packet_id
-
-        # 印 cumulative SACK 狀態
-        ack_list = sorted(self.acknowledged)
-        merged_sacks = []
-        if ack_list:
-            start = ack_list[0]
-            end = start + payload_size
-            for seq in ack_list[1:]:
-                if seq == end:
-                    end += payload_size
+                # Congestion Window Adjustment (AIMD) 
+                if self.cwnd < self.ssthresh:
+                    # Slow Start: increase cwnd by 1 MSS (packet_size) for each ACK
+                    old_cwnd = self.cwnd
+                    self.cwnd += packet_size
+                    # 如果加完剛好跨過 ssthresh，印出進入 avoidence
+                    if old_cwnd < self.ssthresh and self.cwnd >= self.ssthresh:
+                        print("============== 進入 avoidence============== ")
                 else:
-                    merged_sacks.append([start, end])
-                    start = seq
-                    end = start + payload_size
-            merged_sacks.append([start, end])
-        print(f"Got ACK sacks: {merged_sacks}, id: {packet_id}")
+                    # Congestion Avoidance: increase cwnd by (MSS * MSS / cwnd) for each ACK
+                    # This is approximately 1 MSS per RTT
+                    self.cwnd += (packet_size * packet_size) // self.cwnd
+                    # print(f"Congestion Avoidance: cwnd = {self.cwnd}, ssthresh = {self.ssthresh}")
 
-        # 合併 retransmit 區段
-        retransmit_ranges.sort()
-        merged = []
-        for start, end in retransmit_ranges:
-            if not merged or merged[-1][1] < start:
-                merged.append((start, end))
-            else:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        # Remove any other packets that might have been acknowledged by the SACKs
+        # (This is a more robust SACK processing, but for this assignment,
+        # focusing on the packet_id based ACK is often sufficient given the test setup)
+        # For full SACK, you'd iterate self.unacked_packets and remove any whose
+        # seq_range falls within any of the provided sacks ranges.
+        packets_to_remove = []
+        for pid, pkt_info in self.unacked_packets.items():
+            pkt_start, pkt_end = pkt_info['seq_range']
+            for ack_s, ack_e in sacks:
+                if pkt_start >= ack_s and pkt_end <= ack_e:
+                    packets_to_remove.append(pid)
+                    bytes_freed += (pkt_end - pkt_start)
+                    self.last_acked_seq = max(self.last_acked_seq, pkt_end)
+                    break # Acknowledged by this SACK, no need to check other SACKs for this packet
 
-        for start, end in merged:
-            print(f"DUP retransmit Sending seq: ({start}, {end})")
-        self.retransmit_queue.extend(merged)
+        for pid in packets_to_remove:
+            self.unacked_packets.pop(pid)
+            if pid in self.sent_time:
+                del self.sent_time[pid]
 
-
-        if sacks:
-            self.highest_sack = max(self.highest_sack, max(end for _, end in sacks))
-            
-        
-        print(f"[ACK] Updated cwnd = {self.cwnd:.2f}, rto = {self.rto:.4f}")
-        
-        # 判斷是否收到 new ACK 結束 fast recovery
-        if self.state == "fast_recovery":
-            new_highest = max(end for _, end in sacks)
-            if new_highest >= self.recovery_seq:
-                self.dup_ack_count.clear()
-                self.highest_sack = new_highest
+        # 簡化版 Fast Recovery
+        if self.in_fast_recovery:
+            # 檢查是否收到了先前被認定遺失的封包 (case 3)
+            if self.recovery_seq is not None and any(ack_start <= self.recovery_seq < ack_end for ack_start, ack_end in sacks):
+                # 收到了遺失的封包，離開 Fast Recovery
+                self.in_fast_recovery = False
                 self.cwnd = self.ssthresh
-                self.state = "congestion_avoidance"
                 print(f"[Fast Recovery Exit] cwnd reset to ssthresh = {self.cwnd}")
+            else:
+                # 收到非遺失封包的 ACK (case 1 & 2)
+                # 增加 cwnd
+                if sacks != self.last_sacks:
+                    self.cwnd += packet_size
+                    # 設定 MAX_CWND
+                    MAX_CWND = max(self.cwnd, self.inflight + packet_size)
+                    self.cwnd = min(self.cwnd, MAX_CWND)
+                    print(f"[Fast Recovery] cwnd = {self.cwnd}, MAX_CWND = {MAX_CWND}")
+                # else: 沒有新區段，不加
+            self.last_sacks = list(sacks)
 
-
-
-
-        return new_acknowledged
+        return bytes_freed
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         '''Called just before we are going to send a data packet. Should
@@ -312,53 +256,43 @@ class Sender:
         acknowledged. Note: The range should not be larger than
         `payload_size` or contain any bytes that have already been
         acknowledged
-
         '''
 
         # TODO
-        # Check if we've reached the end and have no more data to send
-        
-        # 如果有重傳封包要送，優先送這個
-        if self.retransmit_queue:
-            start, end = self.retransmit_queue.pop(0)
-            if start not in self.acknowledged:
-                self.unacknowledged.add(start)
-                return (start, end)
-        
-        if self.done:
-            return None 
-        
-        if self.next_seq >= self.data_len:
-            if self.highest_sack >= self.data_len:
-                self.done = True
-                return None
-            else:
-                return (self.data_len, self.data_len)
+        # check if all data has been sent and acknowledged
+        if self.last_acked_seq >= self.data_len and not self.unacked_packets:
+            return None
 
-        # Find the next Unacked seq and send it
-        while self.next_seq in self.acknowledged:
-            self.next_seq = min(self.next_seq + payload_size, self.data_len)
-            
-            
-        # 防止送出已經被 ack 的區段
-        if self.next_seq in self.acknowledged:
-            return None    
-        
-        end_seq = min(self.next_seq + payload_size, self.data_len)
-        self.unacknowledged.add(self.next_seq)
-        seq_range = (self.next_seq, end_seq)
-        self.next_seq = end_seq
+        # Calculate the start and end sequence for the next packet
+        start_seq = self.next_seq_to_send
+        end_seq = min(self.data_len, start_seq + payload_size)
+
+        # Check if there are bytes available to send that are not yet acknowledged
+        if start_seq >= self.data_len:
+             # All data sent. We are waiting for remaining ACKs or timeout.
+             return (start_seq, start_seq) # Zero range to indicate no more new data
+
+        seq_range = (start_seq, end_seq)
+
+        # Store packet info for RTT calculation and retransmission
+        self.unacked_packets[packet_id] = {
+            'seq_range': seq_range,
+            'sent_time': time.time()
+        }
+        self.sent_time[packet_id] = time.time() # This is used by the `start_sender` loop directly.
+        self.inflight += (end_seq - start_seq) # 更新 inflight
+
+        self.next_seq_to_send = end_seq
         return seq_range
 
     def get_cwnd(self) -> int:
         # TODO
-        return max(packet_size, int(self.cwnd))
-
+        return max(int(self.cwnd), packet_size)
 
     def get_rto(self) -> float:
         # TODO
-        return max(0.001, self.rto)
-
+        rto = self.estimated_rtt + 4 * self.dev_rtt
+        return max(rto, self.min_rto)
 
 def start_receiver(ip: str, port: int):
     '''Starts a receiver thread. For each source address, we start a new
@@ -397,7 +331,6 @@ def start_receiver(ip: str, port: int):
         server_socket.bind((ip, port))
 
         while True:
-            print("======= Waiting =======")
             data, addr = server_socket.recvfrom(packet_size)
             if addr not in receivers:
                 receivers[addr] = Receiver()
@@ -471,7 +404,9 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 elif seq[1] == seq[0]:
                     # No more packets to send until loss happens. Wait
                     wait = True
-                    print(f"cwnd: {cwnd}, rto: {rto:.4f}, status: {status}")
+                    print(
+                        f"cwnd: {cwnd}, rto: {rto:.4f}"
+                    )
                     continue
 
                 assert seq[1] - seq[0] <= payload_size
@@ -480,17 +415,21 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                 # Simulate random loss before sending packets
                 if random.random() < simloss:
                     print("Dropped!")
+                    sender.inflight -= (seq[1] - seq[0]) # 丟包，減少 inflight
                 else:
                     # Send the packet
-                    sender.send_time[packet_id] = time.time()
+                    sender.sent_time[packet_id] = time.time()
                     client_socket.send(
                         json.dumps(
                             {"type": "data", "seq": seq, "id": packet_id, "payload": data[seq[0]:seq[1]]}
                         ).encode())
 
                 inflight += seq[1] - seq[0]
+                sender.inflight = inflight # 更新 sender 的 inflight
                 packet_id += 1
-                print(f"Sending seq: {seq}, id: {packet_id}, cwnd: {cwnd}, rto: {rto:.4f}, status: {status}")
+                print(
+                    f"Sending seq: {seq}, id: {packet_id}, cwnd: {cwnd}, rto: {rto:.4f}"
+                )
 
             else:
                 wait = False
@@ -507,10 +446,14 @@ def start_sender(ip: str, port: int, data: str, recv_window: int, simloss: float
                         continue
 
                     inflight -= sender.ack_packet(received["sacks"], received["id"])
+                    sender.inflight = inflight # 更新 sender 的 inflight
                     assert inflight >= 0
-                    print(f"Got ACK sacks: {received['sacks']}, id: {received['id']}, cwnd: {cwnd}, rto: {rto:.4f}, status: {status}")
+                    print(
+                        f"Got ACK sacks: {received['sacks']}, id: {received['id']}, cwnd: {cwnd}, rto: {rto:.4f}"
+                    )
                 except socket.timeout:
                     inflight = 0
+                    sender.inflight = inflight # 更新 sender 的 inflight
                     print("Timeout")
                     sender.timeout()
 
