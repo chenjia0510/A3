@@ -255,11 +255,13 @@ class Sender:
 
         if self.retransmit_queue:
             seq_range = self.retransmit_queue.pop(0)
+            now = time.time()
             self.unacked_packets[packet_id] = {
                 'seq_range': seq_range,
-                'sent_time': time.time()
+                'sent_time': now
             }
-            self.sent_time[packet_id] = time.time()
+            if packet_id not in self.sent_time:
+                self.sent_time[packet_id] = now
             print(f"[RETRANS] Retransmitting {seq_range}")
             return seq_range
 
