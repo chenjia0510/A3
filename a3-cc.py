@@ -1,3 +1,6 @@
+#B124020034
+#蔡承家
+
 import argparse
 import json
 import random
@@ -22,7 +25,7 @@ class Receiver:
     def data_packet(self, seq_range: Tuple[int, int], data: str) -> Tuple[Dict[str, Any], str]:
         start_seq, end_seq = seq_range
 
-        # ✅ 如果是已經收過的 segment，還是要回 ACK/SACK 給 sender（重傳進來的情況）
+        #  如果是已經收過的 segment，還是要回 ACK/SACK 給 sender（重傳進來的情況）
         if end_seq <= self.next_expected_seq:
             sack_raw = [(seq, seq + len(payload)) for seq, payload in self.receive_buffer.items()]
             sack_raw.sort()
@@ -44,7 +47,7 @@ class Receiver:
                 "sack": sack_merged
             }, ""
 
-        # ✅ 正常處理未收到的 segment
+        # 正常處理未收到的 segment
         self.receive_buffer[start_seq] = data
 
         app_data = ""
@@ -171,7 +174,7 @@ class Sender:
             self.missing_seq = (ack, min(ack + payload_size, self.data_len))
             self.retransmit_queue.append(self.missing_seq)
 
-            # ✅ 新增：計算 inflight bytes → 設定 MAX_CWND
+            # 新增：計算 inflight bytes → 設定 MAX_CWND
             inflight_bytes = sum(pkt['seq_range'][1] - pkt['seq_range'][0] for pkt in self.unacked_packets.values())
             self.max_cwnd = max(self.cwnd, inflight_bytes + packet_size)
 
