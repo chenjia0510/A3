@@ -101,7 +101,7 @@ class Sender:
         self.min_rto: float = 0.01
 
         self.cwnd: int = packet_size
-        self.ssthresh: int = 30000
+        self.ssthresh: int = 64000
         self.dup_acks: int = 0
         self.last_ack_seq: int = 0
         self.in_fast_recovery: bool = False
