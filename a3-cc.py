@@ -124,11 +124,10 @@ class Sender:
         self.retransmit_queue.clear()
         
         # 如果有 missing_seq，加入 retransmit queue
-        if self.missing_seq:
+        if self.missing_seq and not self.missing_sent:
             self.retransmit_queue.append(self.missing_seq)
+            self.missing_sent = True
             print(f"[Timeout] Retransmit missing_seq {self.missing_seq}")
-            
-        
         
         
         self.seen_sack_ranges.clear()
@@ -177,6 +176,9 @@ class Sender:
             self.max_cwnd = max(self.cwnd, inflight_bytes + packet_size)
 
             self.seen_sack_ranges.clear()
+            
+            print(f"[FR DEBUG] merged={merged}, missing_seq={self.missing_seq}") #刪
+            
             print(f"[FR ENTRY] 3 dupACKs for {ack}, retransmit {self.missing_seq}, cwnd={self.cwnd}, MAX_CWND={self.max_cwnd}")
         # === Exit Fast Recovery if received new ACK ===
         if self.in_fast_recovery:
@@ -221,18 +223,6 @@ class Sender:
                 else:
                     print(f"[Fast Recovery] No new segment detected, cwnd remains at {self.cwnd}")
 
-        # === While in FR: new SACKs increase cwnd ===
-        if self.in_fast_recovery:
-            for r in merged:
-                if r not in self.seen_sack_ranges:
-                    self.seen_sack_ranges.add(r)
-                    if self.cwnd + packet_size <= self.max_cwnd:
-                        self.cwnd += packet_size
-                        print(f"[FR cwnd inc] New SACK {r}, cwnd -> {self.cwnd}")
-                    else:
-                        print(f"[FR capped] New SACK {r}, cwnd capped at {self.cwnd}")
-                else:
-                    print(f"[FR dup SACK] {r}")
 
         # === Free packets covered by any merged ACK range ===
         for ack_start, ack_end in merged:
@@ -265,7 +255,7 @@ class Sender:
 
     def send(self, packet_id: int) -> Optional[Tuple[int, int]]:
         # fallback：missing_seq 沒傳就再補一次
-        if self.in_fast_recovery and self.missing_seq and self.missing_seq not in self.retransmit_queue:
+        if self.in_fast_recovery and self.missing_seq and not self.missing_sent:
             print(f"[SAFE RETRANS] Re-enqueue missing_seq {self.missing_seq}")
             self.retransmit_queue.append(self.missing_seq)
             self.missing_sent = True
