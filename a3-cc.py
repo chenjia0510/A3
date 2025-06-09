@@ -1,5 +1,4 @@
-# Your Name: 宋易珊
-# Your ID: B114020017
+
 
 import argparse
 import json
