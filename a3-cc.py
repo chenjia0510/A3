@@ -1,5 +1,3 @@
-
-
 import argparse
 import json
 import random
@@ -105,18 +103,14 @@ class Sender:
         self.last_ack_seq: int = 0
         self.in_fast_recovery: bool = False
 
-        self.dup_acks: int = 0
-        self.last_ack_seq: int = 0
-        self.in_fast_recovery: bool = False
         self.missing_seq = None
         self.max_cwnd = None
         self.seen_sack_ranges: Set[Tuple[int, int]] = set()
         self.retransmit_queue: List[Tuple[int, int]] = []
-        self.missing_seq = None
         self.missing_sent = False
 
-        
-        
+        # Initialize highest_sack
+        self.highest_sack = 0
 
     def timeout(self):
         print("Timeout detected!")
@@ -201,7 +195,31 @@ class Sender:
                 self.retransmit_queue.clear()
                 self.seen_sack_ranges.clear()
                 print(f"[EXIT FR] exited fast recovery due to new ACK. cwnd -> {self.cwnd}")
-
+        # 收到丟失封包的 ACK，退出 Fast Recovery
+        if self.in_fast_recovery:
+            # Case 3: 收到丟失封包的 ACK，退出 Fast Recovery
+            if self.missing_seq and any(
+                ack_start <= self.missing_seq[0] and ack_end >= self.missing_seq[1]
+                for ack_start, ack_end in merged
+            ):
+                self.in_fast_recovery = False
+                self.cwnd = self.ssthresh
+                self.dup_acks = 0
+                self.missing_seq = None
+                self.missing_sent = False
+                self.max_cwnd = None
+                self.retransmit_queue.clear()
+                self.seen_sack_ranges.clear()
+                print(f"[EXIT FR] exited fast recovery due to ACK for missing_seq. cwnd -> {self.cwnd}")
+            else:
+                # Case 1 和 Case 2: 判斷是否有新區段
+                newly_acked_end = max(end for _, end in merged)
+                if newly_acked_end > self.highest_sack:
+                    self.highest_sack = newly_acked_end
+                    self.cwnd = min(self.cwnd + payload_size, self.max_cwnd)
+                    print(f"[Fast Recovery] New segment detected, cwnd increased to {self.cwnd}")
+                else:
+                    print(f"[Fast Recovery] No new segment detected, cwnd remains at {self.cwnd}")
 
         # === While in FR: new SACKs increase cwnd ===
         if self.in_fast_recovery:
